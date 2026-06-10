@@ -13,6 +13,48 @@ def get_size(data):
     return max(jax.tree_util.tree_leaves(sizes))
 
 
+BMM_DEFAULT_BUDGETS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)
+
+
+def get_bmm_budgets(config):
+    """Return sorted positive BMM budgets no larger than max_budget."""
+    budgets = np.asarray(config.get("budgets", BMM_DEFAULT_BUDGETS), dtype=np.int32)
+    max_budget = int(config.get("max_budget", int(budgets.max())))
+    if max_budget < 1:
+        raise ValueError("BMM-TRL requires max_budget >= 1.")
+
+    budgets = np.unique(budgets[(budgets >= 1) & (budgets <= max_budget)])
+    if len(budgets) == 0 or budgets[0] != 1:
+        budgets = np.unique(np.concatenate([np.asarray([1], dtype=np.int32), budgets]))
+    if budgets[-1] != max_budget:
+        budgets = np.unique(
+            np.concatenate([budgets, np.asarray([max_budget], dtype=np.int32)])
+        )
+    if not np.all(budgets[1:] > budgets[:-1]):
+        raise ValueError(f"BMM-TRL budgets must be strictly increasing: {budgets}")
+    return budgets.astype(np.int32)
+
+
+def sample_bmm_positive_budgets(offsets, budgets):
+    """Sample a budget H with H >= each observed trajectory offset."""
+    min_budget_idxs = np.searchsorted(budgets, offsets, side="left")
+    min_budget_idxs = np.minimum(min_budget_idxs, len(budgets) - 1)
+    spans = len(budgets) - min_budget_idxs
+    sampled_idxs = min_budget_idxs + np.floor(np.random.rand(len(offsets)) * spans).astype(
+        np.int32
+    )
+    return budgets[sampled_idxs]
+
+
+def sample_bmm_negative_budgets(offsets, budgets, neg_frac):
+    """Sample weak negative budgets H < neg_frac * offset where possible."""
+    counts = np.searchsorted(budgets, neg_frac * offsets, side="left")
+    valids = (counts > 0).astype(np.float32)
+    safe_counts = np.maximum(counts, 1)
+    sampled_idxs = np.floor(np.random.rand(len(offsets)) * safe_counts).astype(np.int32)
+    return budgets[sampled_idxs], valids
+
+
 class Dataset(FrozenDict):
     """Dataset class.
 
@@ -47,7 +89,11 @@ class Dataset(FrozenDict):
 
     def get_random_idxs(self, num_idxs):
         """Return `num_idxs` random indices."""
-        if "valids" in self._dict:
+        if hasattr(self, "valid_idxs"):
+            return self.valid_idxs[
+                np.random.randint(len(self.valid_idxs), size=num_idxs)
+            ]
+        elif "valids" in self._dict:
             return self.valid_idxs[
                 np.random.randint(len(self.valid_idxs), size=num_idxs)
             ]
@@ -156,17 +202,21 @@ class GCDataset:
         """
         if idxs is None:
             idxs = self.dataset.get_random_idxs(batch_size)
+        idxs = np.asarray(idxs)
 
         batch = self.dataset.sample(batch_size, idxs)
         dataset_config = self.config["dataset"]
 
-        value_goal_idxs = self.sample_goals(
-            idxs,
-            dataset_config["value_p_curgoal"],
-            dataset_config["value_p_trajgoal"],
-            dataset_config["value_p_randomgoal"],
-            dataset_config["value_geom_sample"],
-        )
+        if self.config.get("agent_name") == "bmm_trl":
+            value_goal_idxs = self.sample_bmm_value_goals(idxs)
+        else:
+            value_goal_idxs = self.sample_goals(
+                idxs,
+                dataset_config["value_p_curgoal"],
+                dataset_config["value_p_trajgoal"],
+                dataset_config["value_p_randomgoal"],
+                dataset_config["value_geom_sample"],
+            )
         actor_goal_idxs = self.sample_goals(
             idxs,
             dataset_config["actor_p_curgoal"],
@@ -216,8 +266,111 @@ class GCDataset:
                 )
                 batch["value_cur_goals"] = self.get_observations(idxs)
                 batch["value_next_goals"] = self.get_observations(idxs + 1)
+        elif self.config.get("agent_name") == "bmm_trl":
+            assert (idxs != final_state_idxs).all() and (idxs != value_goal_idxs).all()
+            self.add_bmm_fields(batch, idxs, value_goal_idxs, final_state_idxs)
 
         return batch
+
+    def sample_bmm_value_goals(self, idxs):
+        """Sample future same-trajectory value goals with offsets covered by BMM budgets."""
+        batch_size = len(idxs)
+        dataset_config = self.config["dataset"]
+        budgets = get_bmm_budgets(self.config)
+        max_offset = int(budgets[-1])
+
+        final_state_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, idxs)]
+        max_goal_idxs = np.minimum(final_state_idxs, idxs + max_offset)
+        spans = max_goal_idxs - idxs
+        if not np.all(spans >= 1):
+            raise ValueError("BMM-TRL sampled a terminal index; valid_idxs are malformed.")
+
+        if dataset_config["value_geom_sample"]:
+            offsets = np.random.geometric(1 - self.config["discount"], size=batch_size)
+            offsets = np.minimum(offsets, spans)
+        else:
+            offsets = 1 + np.floor(np.random.rand(batch_size) * spans).astype(np.int32)
+
+        return idxs + offsets
+
+    def add_bmm_fields(self, batch, idxs, value_goal_idxs, final_state_idxs):
+        """Add BMM-TRL budget, witness, weak-negative, and monotonicity fields."""
+        batch_size = len(idxs)
+        budgets = get_bmm_budgets(self.config)
+        split_mode = self.config.get("split_mode", "half")
+        if split_mode != "half":
+            raise ValueError("BMM-TRL prototype only supports split_mode='half'.")
+
+        offsets = (value_goal_idxs - idxs).astype(np.int32)
+        value_budgets = sample_bmm_positive_budgets(offsets, budgets).astype(np.int32)
+
+        left_budgets = np.where(value_budgets > 1, value_budgets // 2, 1).astype(
+            np.int32
+        )
+        right_budgets = np.where(
+            value_budgets > 1, value_budgets - left_budgets, 1
+        ).astype(np.int32)
+
+        midpoint_los = np.maximum(idxs + 1, value_goal_idxs - right_budgets)
+        midpoint_his = np.minimum(value_goal_idxs - 1, idxs + left_budgets)
+        trans_valids = ((offsets > 1) & (midpoint_los <= midpoint_his)).astype(
+            np.float32
+        )
+        midpoint_widths = np.maximum(midpoint_his - midpoint_los + 1, 1)
+        sampled_midpoints = midpoint_los + np.floor(
+            np.random.rand(batch_size) * midpoint_widths
+        ).astype(np.int32)
+        fallback_midpoints = np.minimum(idxs + 1, final_state_idxs)
+        value_midpoint_idxs = np.where(
+            trans_valids > 0, sampled_midpoints, fallback_midpoints
+        )
+
+        neg_budgets, neg_valids = sample_bmm_negative_budgets(
+            offsets, budgets, float(self.config.get("budget_neg_frac", 0.5))
+        )
+        random_goal_idxs = self.dataset.get_random_idxs(batch_size)
+        random_budgets = budgets[np.random.randint(len(budgets), size=batch_size)]
+
+        if len(budgets) > 1:
+            mono_low_idxs = np.random.randint(len(budgets) - 1, size=batch_size)
+            mono_low_budgets = budgets[mono_low_idxs]
+            mono_high_budgets = budgets[mono_low_idxs + 1]
+        else:
+            mono_low_budgets = np.full(batch_size, budgets[0], dtype=np.int32)
+            mono_high_budgets = np.full(batch_size, budgets[0], dtype=np.int32)
+
+        batch["value_offsets"] = offsets
+        batch["value_budgets"] = value_budgets
+        batch["value_left_budgets"] = left_budgets
+        batch["value_right_budgets"] = right_budgets
+        batch["value_midpoint_offsets"] = (value_midpoint_idxs - idxs).astype(np.int32)
+        batch["value_midpoint_observations"] = self.get_observations(
+            value_midpoint_idxs
+        )
+        batch["value_midpoint_actions"] = self.dataset["actions"][value_midpoint_idxs]
+        batch["next_actions"] = self.dataset["actions"][idxs + 1]
+        batch["trans_valids"] = trans_valids
+        batch["value_neg_budgets"] = neg_budgets.astype(np.int32)
+        batch["value_neg_valids"] = neg_valids
+        batch["value_random_budgets"] = random_budgets.astype(np.int32)
+        batch["value_random_goal_observations"] = self.get_observations(
+            random_goal_idxs
+        )
+        batch["mono_low_budgets"] = mono_low_budgets.astype(np.int32)
+        batch["mono_high_budgets"] = mono_high_budgets.astype(np.int32)
+
+        if "oracle_reps" in self.dataset:
+            batch["value_midpoint_goals"] = self.dataset["oracle_reps"][
+                value_midpoint_idxs
+            ]
+            batch["value_cur_goals"] = self.dataset["oracle_reps"][idxs]
+            batch["value_next_goals"] = self.dataset["oracle_reps"][idxs + 1]
+            batch["value_random_goals"] = self.dataset["oracle_reps"][random_goal_idxs]
+        else:
+            batch["value_midpoint_goals"] = self.get_observations(value_midpoint_idxs)
+            batch["value_cur_goals"] = self.get_observations(idxs)
+            batch["value_next_goals"] = self.get_observations(idxs + 1)
+            batch["value_random_goals"] = self.get_observations(random_goal_idxs)
 
     def sample_goals(
         self, idxs, p_curgoal, p_trajgoal, p_randomgoal, geom_sample, discount=None

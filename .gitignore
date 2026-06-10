@@ -6,7 +6,9 @@ __pycache__/
 .idea/
 .ruff_cache/
 *.sh
-exp
-ipynbs
-data
-slurm_outputs
+exp/
+wandb/
+ipynbs/
+data/
+slurm_outputs/
+scripts/bmm_tabular_errors.png
