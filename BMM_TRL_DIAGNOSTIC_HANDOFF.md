@@ -32,9 +32,10 @@ git --git-dir=.project-git --work-tree=. status --short
 
 ### Committed TRL changes
 
-Three BMM-related commits exist in `TRL/trl`:
+Core BMM-related commits in `TRL/trl`:
 
 ```text
+e5555e8 Add BMM diagnostic handoff
 ddcda93 Add BMM hard negatives and report gate
 512f4bb Add BMM reachability diagnostics
 f757f53 Add BMM-TRL prototype
@@ -82,6 +83,7 @@ Commit `ddcda93` adds:
 - Hard-negative metrics in `agent.update`
 - A JSON report gate for reachability diagnostics
 - Tests for hard-negative sampling and report gating
+- A later refinement inside the same committed change weights valid hard-negative budgets by budget size. This was added after training logs showed uniform valid-budget sampling mostly trained small/mid-budget negatives and under-covered `H=256/512`.
 
 ## Verification Status
 
@@ -145,7 +147,70 @@ sd000_20260610_134556, hard negatives, lambda_hard_neg=1.0 and lower lambda_tran
   mean_monotonicity_violation=0.1778
 ```
 
-The hard-negative change improves some mid-budget score scale, but it does not solve large-budget collapse. For `H=512`, unreachable pairs still get scores around `0.93`.
+The first hard-negative change improved some mid-budget score scale, but it did not solve large-budget collapse. For `H=512`, unreachable pairs still got scores around `0.93`.
+
+### Additional weighted hard-negative diagnosis
+
+After inspecting training logs for `sd000_20260610_134016` and `sd000_20260610_134556`, the hard-negative sampler itself looked under-targeted:
+
+```text
+pre-weighted sampler, step=20000:
+  hard_neg_budget_mean ~= 63.9
+  hard_neg_offset_mean ~= 130.8
+  hard_neg_valid_frac ~= 1.0
+```
+
+This means almost all batches had valid hard negatives, but the hard-negative budget distribution was centered near `H=64`, not the failing `H=256/512` range. The sampler was changed to sample among valid hard-negative budgets with probability proportional to budget size.
+
+With weighted hard-negative sampling:
+
+```text
+sd000_20260610_135256, default weights, step=20000:
+  hard_neg_budget_mean ~= 200.4
+  hard_neg_offset_mean ~= 342.2
+  hard_neg_r_mean ~= 0.3792
+  pos_r_mean ~= 0.7346
+  rand_r_mean ~= 0.1727
+  training mono_violation ~= 0.2646
+
+sd000_20260610_135912, lambda_trans=0.1, lambda_hard_neg=1.0, step=20000:
+  hard_neg_budget_mean ~= 200.4
+  hard_neg_offset_mean ~= 342.2
+  hard_neg_r_mean ~= 0.3047
+  pos_r_mean ~= 0.6732
+  rand_r_mean ~= 0.1409
+  training mono_violation ~= 0.1387
+```
+
+Weighted sampling did reduce high-budget negative scores compared with the pre-weighted runs, but it still did not produce enough high-budget AUC/gap. Final checkpoint diagnostics:
+
+```text
+sd000_20260610_135256, weighted hard negatives, default weights:
+  10k:
+    mono=0.0000, min_mono=0.0000
+    H=128: auc=0.7894, pos=0.4630, neg=0.2887, gap=0.1743
+    H=256: auc=0.6869, pos=0.6323, neg=0.5668, gap=0.0655
+    H=512: auc=0.5810, pos=0.8198, neg=0.8101, gap=0.0097
+  20k:
+    mono=0.2480, min_mono=0.2147
+    H=128: auc=0.7864, pos=0.4597, neg=0.2781, gap=0.1816
+    H=256: auc=0.6755, pos=0.5994, neg=0.5388, gap=0.0606
+    H=512: auc=0.6109, pos=0.8083, neg=0.7959, gap=0.0124
+
+sd000_20260610_135912, weighted hard negatives, lambda_trans=0.1, lambda_hard_neg=1.0:
+  10k:
+    mono=0.0000, min_mono=0.0000
+    H=128: auc=0.7858, pos=0.3252, neg=0.1890, gap=0.1361
+    H=256: auc=0.6858, pos=0.5060, neg=0.4364, gap=0.0696
+    H=512: auc=0.5693, pos=0.7675, neg=0.7567, gap=0.0109
+  20k:
+    mono=0.1048, min_mono=0.0748
+    H=128: auc=0.7887, pos=0.3226, neg=0.1802, gap=0.1424
+    H=256: auc=0.6709, pos=0.4757, neg=0.4139, gap=0.0618
+    H=512: auc=0.5943, pos=0.7678, neg=0.7532, gap=0.0146
+```
+
+The final fallback (`sd000_20260610_135912`) is the best-behaved run on monotonicity, but it still fails the strict gate on low-budget absolute gaps and high-budget `H=256/512` AUC/gap.
 
 ## Strong Symptom From Offset Buckets
 
@@ -185,8 +250,9 @@ These are hypotheses, not confirmed causes:
    - If either/both target branches become overconfident for large budgets, transitive BCE can reinforce large-H optimism.
    - Lowering `lambda_trans` helped score scale in some places, but did not fix `H=512`.
 
-3. The current hard-negative sampler may not put enough pressure on the exact failure distribution.
-   - It samples same-trajectory goals beyond budget, but the valid fraction depends on remaining trajectory length.
+3. The current weighted hard-negative sampler still may not put enough pressure on the exact failure distribution.
+   - It now biases valid hard negatives toward large budgets, and training `hard_neg_budget_mean` increased from about `64` to about `200`.
+   - It still samples one hard negative per transition, so `H=256/512` may remain underrepresented relative to positive/transitive terms.
    - The large-H evaluation negatives are rare because many random validation pairs are positive at high budgets.
    - We may need per-budget balanced hard negatives or a diagnostic-training sampler that explicitly targets `offset in (H, 4H]`.
 
@@ -214,6 +280,7 @@ These are hypotheses, not confirmed causes:
      - choose `offset > H` where available
      - train BCE target zero
    - Consider sampling negatives from the exact diagnostic buckets: `1.25H`, `2H`, and `4H`.
+   - Consider multiple hard negatives per positive, especially for `H=128/256/512`, instead of only one weighted hard negative.
 
 4. Separate positive and transitive effects.
    - Run short jobs with:
@@ -221,15 +288,25 @@ These are hypotheses, not confirmed causes:
      - stronger hard negatives
      - lower `lambda_pos`
    - Check whether high-H negative scores drop before reintroducing transitive bootstrapping.
+   - The tried fallback `lambda_trans=0.1`, `lambda_hard_neg=1.0` improved monotonicity in the weighted run but still failed `H=256/512` AUC/gap, so the next useful run should change sampler/loss structure, not only these two weights.
 
 5. Consider making random-goal negatives proper BCE negatives.
    - The current random-goal loss is a hinge above `rho`.
    - For early diagnostics, direct BCE-to-zero may provide a clearer signal than a soft hinge.
 
-6. Inspect action conditioning.
+6. Revisit the gate thresholds for low budgets separately from high-budget collapse.
+   - Small budgets often have good AUC but tiny absolute score gaps because both positive and negative means are near zero.
+   - The low-budget gate failures may indicate under-confidence rather than wrong ranking.
+   - High-budget failures are more serious because AUC remains low and positive-negative gaps are tiny.
+
+7. Inspect action conditioning.
    - The diagnostic pairs use dataset action at the source state.
    - A same-trajectory goal with large offset may be reachable eventually but not necessarily via the current one-step action.
    - Confirm whether the intended critic semantics are "reachable within H after taking action a now" or "state-goal reachability within H"; the current implementation is action-conditioned like TRL.
+
+8. Consider an explicit supervised diagnostic-only critic mode.
+   - Train BCE labels directly on same-trajectory pairs with `label = offset <= H`, balanced per budget.
+   - This would test whether the architecture and budget feature can represent the desired classifier before adding bootstrapped max-min targets back in.
 
 ## Reproduction Commands
 
