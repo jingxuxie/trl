@@ -40,6 +40,53 @@ can also be found in the same directory.
 Tuned hyperparameters for each environment and agent are provided in the paper.
 Complete list of TRL commands here: [hyperparameters.sh](hyperparameters.sh)
 
+## BMM-TRL prototype diagnostics
+
+The BMM-TRL prototype lives in [agents/bmm_trl.py](agents/bmm_trl.py). It is an
+early budgeted reachability variant intended for value diagnostics before policy
+tuning.
+
+Run the lightweight checks:
+
+```bash
+conda run -n bmm-trl python scripts/test_bmm_tabular.py
+conda run -n bmm-trl python scripts/test_bmm_dataset_shapes.py
+conda run -n bmm-trl python scripts/test_bmm_agent_shapes.py
+conda run -n bmm-trl python scripts/test_bmm_reachability_eval.py
+```
+
+Run a saved PointMaze smoke training job:
+
+```bash
+conda run -n bmm-trl env WANDB_MODE=offline python main.py \
+    --env_name=pointmaze-medium-navigate-v0 \
+    --agent=agents/bmm_trl.py \
+    --offline_steps=20000 \
+    --log_interval=1000 \
+    --eval_interval=0 \
+    --video_episodes=0 \
+    --save_interval=10000 \
+    --agent.batch_size=512 \
+    --agent.actor_hidden_dims="(256, 256)" \
+    --agent.value_hidden_dims="(256, 256)"
+```
+
+Evaluate budgeted reachability from a saved checkpoint:
+
+```bash
+conda run -n bmm-trl python scripts/eval_bmm_reachability.py \
+    --env_name=pointmaze-medium-navigate-v0 \
+    --agent=agents/bmm_trl.py \
+    --agent.batch_size=512 \
+    --agent.actor_hidden_dims="(256, 256)" \
+    --agent.value_hidden_dims="(256, 256)" \
+    --restore_path="exp/mrl/Debug/<run_dir>" \
+    --restore_epoch=10000
+```
+
+Use the diagnostics to check that positive trajectory pairs score higher than
+negative pairs, scores vary with budget, and monotonicity violations stay small.
+
 ```bash
 
 # TRL
