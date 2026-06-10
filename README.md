@@ -53,6 +53,8 @@ conda run -n bmm-trl python scripts/test_bmm_tabular.py
 conda run -n bmm-trl python scripts/test_bmm_dataset_shapes.py
 conda run -n bmm-trl python scripts/test_bmm_agent_shapes.py
 conda run -n bmm-trl python scripts/test_bmm_reachability_eval.py
+conda run -n bmm-trl python scripts/test_bmm_hard_neg_shapes.py
+conda run -n bmm-trl python scripts/test_bmm_reachability_gate.py
 ```
 
 Run a saved PointMaze smoke training job:
@@ -67,6 +69,8 @@ conda run -n bmm-trl env WANDB_MODE=offline python main.py \
     --video_episodes=0 \
     --save_interval=10000 \
     --agent.batch_size=512 \
+    --agent.max_budget=512 \
+    --agent.budgets="(1, 2, 4, 8, 16, 32, 64, 128, 256, 512)" \
     --agent.actor_hidden_dims="(256, 256)" \
     --agent.value_hidden_dims="(256, 256)"
 ```
@@ -78,10 +82,20 @@ conda run -n bmm-trl python scripts/eval_bmm_reachability.py \
     --env_name=pointmaze-medium-navigate-v0 \
     --agent=agents/bmm_trl.py \
     --agent.batch_size=512 \
+    --agent.max_budget=512 \
+    --agent.budgets="(1, 2, 4, 8, 16, 32, 64, 128, 256, 512)" \
     --agent.actor_hidden_dims="(256, 256)" \
     --agent.value_hidden_dims="(256, 256)" \
     --restore_path="exp/mrl/Debug/<run_dir>" \
-    --restore_epoch=10000
+    --restore_epoch=10000 \
+    --output_json="exp/mrl/Debug/<run_dir>/bmm_reachability_10000.json"
+```
+
+Gate the diagnostic report before policy evaluation:
+
+```bash
+conda run -n bmm-trl python scripts/check_bmm_reachability_report.py \
+    --report_path="exp/mrl/Debug/<run_dir>/bmm_reachability_10000.json"
 ```
 
 Use the diagnostics to check that positive trajectory pairs score higher than

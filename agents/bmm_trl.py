@@ -141,6 +141,21 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             batch["value_neg_valids"],
         )
 
+        aug_hard_neg_goals = augment_goal_with_budget(
+            batch["value_hard_neg_goals"], batch["value_hard_neg_budgets"], max_budget
+        )
+        hard_neg_logits = self.network.select("critic")(
+            batch["observations"],
+            goals=aug_hard_neg_goals,
+            actions=batch["actions"],
+            params=grad_params,
+        )
+        hard_neg_r = jax.nn.sigmoid(hard_neg_logits)
+        loss_hard_neg = masked_mean(
+            self.bce_loss(hard_neg_logits, jnp.zeros_like(hard_neg_logits)),
+            batch["value_hard_neg_valids"],
+        )
+
         aug_rand_goals = augment_goal_with_budget(
             batch["value_random_goals"], batch["value_random_budgets"], max_budget
         )
@@ -181,8 +196,20 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             self.config["lambda_trans"] * loss_trans
             + self.config["lambda_pos"] * loss_pos
             + self.config["lambda_budget_neg"] * loss_budget_neg
+            + self.config["lambda_hard_neg"] * loss_hard_neg
             + self.config["lambda_rand_hinge"] * loss_rand_hinge
             + self.config["lambda_mono"] * loss_mono
+        )
+
+        hard_neg_budgets = jnp.asarray(
+            batch["value_hard_neg_budgets"], dtype=jnp.float32
+        )
+        hard_neg_offsets = jnp.asarray(
+            batch["value_hard_neg_offsets"], dtype=jnp.float32
+        )
+        hard_neg_valids = batch["value_hard_neg_valids"]
+        hard_neg_offset_over_budget = hard_neg_offsets / jnp.maximum(
+            hard_neg_budgets, 1.0
         )
 
         return total_loss, {
@@ -190,6 +217,7 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             "loss_trans": loss_trans,
             "loss_pos": loss_pos,
             "loss_budget_neg": loss_budget_neg,
+            "loss_hard_neg": loss_hard_neg,
             "loss_rand_hinge": loss_rand_hinge,
             "loss_mono": loss_mono,
             "r_mean": r.mean(),
@@ -200,10 +228,17 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             "second_r_mean": second_r.mean(),
             "pos_r_mean": r.mean(),
             "neg_r_mean": neg_r.mean(),
+            "hard_neg_r_mean": masked_mean(hard_neg_r, hard_neg_valids),
             "rand_r_mean": rand_r.mean(),
             "mono_violation": (low_r > high_r).mean(),
             "trans_valid_frac": batch["trans_valids"].mean(),
             "neg_valid_frac": batch["value_neg_valids"].mean(),
+            "hard_neg_valid_frac": hard_neg_valids.mean(),
+            "hard_neg_budget_mean": masked_mean(hard_neg_budgets, hard_neg_valids),
+            "hard_neg_offset_mean": masked_mean(hard_neg_offsets, hard_neg_valids),
+            "hard_neg_offset_over_budget_mean": masked_mean(
+                hard_neg_offset_over_budget, hard_neg_valids
+            ),
         }
 
     def actor_loss(self, batch, grad_params, rng=None):
@@ -528,12 +563,15 @@ def get_config():
             split_min_frac=0.25,
             num_split_samples=1,
             num_witnesses=1,
-            lambda_trans=0.5,
+            lambda_trans=0.25,
             lambda_pos=1.0,
-            lambda_budget_neg=0.05,
-            lambda_rand_hinge=0.02,
-            lambda_mono=0.05,
+            lambda_budget_neg=0.1,
+            lambda_hard_neg=0.5,
+            lambda_rand_hinge=0.05,
+            lambda_mono=0.1,
             budget_neg_frac=0.5,
+            hard_neg_min_factor=1.25,
+            hard_neg_max_factor=4.0,
             rand_hinge_rho=0.3,
             actor_budget_mode="max",
             actor_budget_threshold=0.5,

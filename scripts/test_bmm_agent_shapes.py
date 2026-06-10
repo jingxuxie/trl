@@ -65,6 +65,7 @@ def main():
         "critic/loss_trans",
         "critic/loss_pos",
         "critic/loss_budget_neg",
+        "critic/loss_hard_neg",
         "critic/loss_rand_hinge",
         "critic/loss_mono",
         "actor/actor_loss",
@@ -97,6 +98,17 @@ def main():
     )
     assert one_batch_action.shape == batch["actions"][:1].shape
     assert bool(jnp.all(jnp.isfinite(one_batch_action)))
+
+    zero_config = make_config()
+    zero_config.lambda_hard_neg = 0.0
+    zero_dataset = GCDataset(make_fake_dataset(), zero_config)
+    zero_example_batch = zero_dataset.sample(1)
+    zero_batch = zero_dataset.sample(zero_config.batch_size)
+    zero_agent = BMMTRLAgent.create(4, zero_example_batch, zero_config)
+    _, zero_info = zero_agent.update(zero_batch)
+    assert "critic/loss_hard_neg" in zero_info
+    for key, value in zero_info.items():
+        assert bool(jnp.all(jnp.isfinite(value))), f"Non-finite metric {key}: {value}"
 
     print("BMM agent update and sample_actions smoke checks passed.")
 

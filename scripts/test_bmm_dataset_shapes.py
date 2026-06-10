@@ -62,6 +62,10 @@ def main():
         "trans_valids",
         "value_neg_budgets",
         "value_neg_valids",
+        "value_hard_neg_budgets",
+        "value_hard_neg_goals",
+        "value_hard_neg_offsets",
+        "value_hard_neg_valids",
         "value_random_goals",
         "value_random_goal_observations",
         "value_random_budgets",
@@ -85,6 +89,12 @@ def main():
     assert np.all(
         batch["value_neg_budgets"][neg_valid]
         < config.budget_neg_frac * batch["value_offsets"][neg_valid]
+    )
+
+    hard_valid = batch["value_hard_neg_valids"] > 0
+    assert np.all(
+        batch["value_hard_neg_offsets"][hard_valid]
+        > batch["value_hard_neg_budgets"][hard_valid]
     )
 
     print("BMM dataset shape checks passed.")

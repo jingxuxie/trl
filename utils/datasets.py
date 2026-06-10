@@ -55,6 +55,56 @@ def sample_bmm_negative_budgets(offsets, budgets, neg_frac):
     return budgets[sampled_idxs], valids
 
 
+def sample_bmm_hard_negative_pairs(
+    idxs,
+    final_state_idxs,
+    budgets,
+    min_factor,
+    max_factor,
+):
+    """Sample same-trajectory goals that are beyond their sampled budget."""
+    batch_size = len(idxs)
+    remaining = (final_state_idxs - idxs).astype(np.int32)
+    hard_budgets = budgets[np.random.randint(len(budgets), size=batch_size)].astype(
+        np.int32
+    )
+    hard_offsets = np.minimum(np.maximum(remaining, 1), hard_budgets).astype(np.int32)
+    hard_valids = np.zeros(batch_size, dtype=np.float32)
+
+    for i in range(batch_size):
+        valid_budget_idxs = []
+        lows = []
+        highs = []
+        for budget_idx, budget in enumerate(budgets):
+            budget = int(budget)
+            low = max(budget + 1, int(np.ceil(min_factor * budget)))
+            high = min(int(remaining[i]), int(np.floor(max_factor * budget)))
+            if low <= high:
+                valid_budget_idxs.append(budget_idx)
+                lows.append(low)
+                highs.append(high)
+
+        if len(valid_budget_idxs) == 0:
+            continue
+
+        # Bias toward large budgets; the hard-negative loss is mainly guarding
+        # against high-H all-ones collapse.
+        valid_budgets = budgets[np.asarray(valid_budget_idxs, dtype=np.int32)].astype(
+            np.float64
+        )
+        probs = valid_budgets / valid_budgets.sum()
+        choice = int(np.searchsorted(np.cumsum(probs), np.random.rand(), side="right"))
+        choice = min(choice, len(valid_budget_idxs) - 1)
+        hard_budgets[i] = budgets[valid_budget_idxs[choice]]
+        hard_offsets[i] = lows[choice] + int(
+            np.floor(np.random.rand() * (highs[choice] - lows[choice] + 1))
+        )
+        hard_valids[i] = 1.0
+
+    hard_goal_idxs = idxs + hard_offsets
+    return hard_goal_idxs.astype(np.int32), hard_offsets, hard_budgets, hard_valids
+
+
 class Dataset(FrozenDict):
     """Dataset class.
 
@@ -328,6 +378,18 @@ class GCDataset:
         neg_budgets, neg_valids = sample_bmm_negative_budgets(
             offsets, budgets, float(self.config.get("budget_neg_frac", 0.5))
         )
+        (
+            hard_neg_goal_idxs,
+            hard_neg_offsets,
+            hard_neg_budgets,
+            hard_neg_valids,
+        ) = sample_bmm_hard_negative_pairs(
+            idxs,
+            final_state_idxs,
+            budgets,
+            float(self.config.get("hard_neg_min_factor", 1.25)),
+            float(self.config.get("hard_neg_max_factor", 4.0)),
+        )
         random_goal_idxs = self.dataset.get_random_idxs(batch_size)
         random_budgets = budgets[np.random.randint(len(budgets), size=batch_size)]
 
@@ -352,6 +414,9 @@ class GCDataset:
         batch["trans_valids"] = trans_valids
         batch["value_neg_budgets"] = neg_budgets.astype(np.int32)
         batch["value_neg_valids"] = neg_valids
+        batch["value_hard_neg_offsets"] = hard_neg_offsets.astype(np.int32)
+        batch["value_hard_neg_budgets"] = hard_neg_budgets.astype(np.int32)
+        batch["value_hard_neg_valids"] = hard_neg_valids
         batch["value_random_budgets"] = random_budgets.astype(np.int32)
         batch["value_random_goal_observations"] = self.get_observations(
             random_goal_idxs
@@ -366,11 +431,15 @@ class GCDataset:
             batch["value_cur_goals"] = self.dataset["oracle_reps"][idxs]
             batch["value_next_goals"] = self.dataset["oracle_reps"][idxs + 1]
             batch["value_random_goals"] = self.dataset["oracle_reps"][random_goal_idxs]
+            batch["value_hard_neg_goals"] = self.dataset["oracle_reps"][
+                hard_neg_goal_idxs
+            ]
         else:
             batch["value_midpoint_goals"] = self.get_observations(value_midpoint_idxs)
             batch["value_cur_goals"] = self.get_observations(idxs)
             batch["value_next_goals"] = self.get_observations(idxs + 1)
             batch["value_random_goals"] = self.get_observations(random_goal_idxs)
+            batch["value_hard_neg_goals"] = self.get_observations(hard_neg_goal_idxs)
 
     def sample_goals(
         self, idxs, p_curgoal, p_trajgoal, p_randomgoal, geom_sample, discount=None
