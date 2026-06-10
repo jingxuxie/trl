@@ -30,6 +30,9 @@ flags.DEFINE_string("restore_path", None, "Directory or glob containing saved pa
 flags.DEFINE_integer("restore_epoch", None, "Checkpoint epoch to restore.")
 flags.DEFINE_integer("seed", 0, "Random seed.")
 flags.DEFINE_integer("num_pairs", 4096, "Random validation pairs per budget.")
+flags.DEFINE_integer(
+    "balanced_pairs", 4096, "Balanced near-boundary validation pairs per budget."
+)
 flags.DEFINE_integer("score_batch_size", 8192, "Batch size for critic scoring.")
 flags.DEFINE_integer("bucket_samples", 512, "Pairs per offset bucket.")
 flags.DEFINE_integer("max_offset_factor", 4, "Max random offset as factor of max budget.")
@@ -42,6 +45,7 @@ config_flags.DEFINE_config_file("agent", "agents/bmm_trl.py", lock_config=False)
 def print_report(report):
     print("\nBMM reachability diagnostics")
     print(f"Random pairs: {report['random_pair_count']}")
+    print(f"Balanced pairs: {report.get('balanced_pair_count', 0)}")
     print(f"Max sampled offset: {report['max_offset']}")
     print(
         "Monotonicity violation: "
@@ -68,6 +72,26 @@ def print_report(report):
             f"{format_metric(ens_min['auc'])} | {mean['pos_count']:5d} | {mean['neg_count']:5d}"
         )
 
+    if report.get("balanced_budget_rows"):
+        print("\nBalanced near-boundary by budget")
+        print(
+            "H | bce | acc | pos | neg | auc | min_bce | min_acc | min_pos | min_neg | min_auc | pos_n | neg_n"
+        )
+        print(
+            "--|-----|-----|-----|-----|-----|---------|---------|---------|---------|---------|-------|------"
+        )
+        for row in report["balanced_budget_rows"]:
+            mean = row["mean"]
+            ens_min = row["ensemble_min"]
+            print(
+                f"{row['budget']:4d} | {format_metric(mean['bce'])} | "
+                f"{format_metric(mean['accuracy'])} | {format_metric(mean['pos_mean'])} | "
+                f"{format_metric(mean['neg_mean'])} | {format_metric(mean['auc'])} | "
+                f"{format_metric(ens_min['bce'])} | {format_metric(ens_min['accuracy'])} | "
+                f"{format_metric(ens_min['pos_mean'])} | {format_metric(ens_min['neg_mean'])} | "
+                f"{format_metric(ens_min['auc'])} | {mean['pos_count']:5d} | {mean['neg_count']:5d}"
+            )
+
     print("\nOffset buckets")
     print("H | offset | offset/H | label | mean_score | min_score | n")
     print("--|--------|----------|-------|------------|-----------|---")
@@ -89,6 +113,15 @@ def write_outputs(report):
         rows = []
         for row in report["budget_rows"]:
             flat = {"kind": "budget", "budget": row["budget"]}
+            for prefix, metrics in (
+                ("mean", row["mean"]),
+                ("ensemble_min", row["ensemble_min"]),
+            ):
+                for key, value in metrics.items():
+                    flat[f"{prefix}_{key}"] = value
+            rows.append(flat)
+        for row in report.get("balanced_budget_rows", []):
+            flat = {"kind": "balanced_budget", "budget": row["budget"]}
             for prefix, metrics in (
                 ("mean", row["mean"]),
                 ("ensemble_min", row["ensemble_min"]),
@@ -144,6 +177,7 @@ def main(_):
         agent,
         val_dataset,
         num_pairs=FLAGS.num_pairs,
+        balanced_pairs=FLAGS.balanced_pairs,
         score_batch_size=FLAGS.score_batch_size,
         max_offset_factor=FLAGS.max_offset_factor,
         bucket_samples=FLAGS.bucket_samples,

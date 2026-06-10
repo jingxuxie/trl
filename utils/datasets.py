@@ -282,7 +282,7 @@ class GCDataset:
             batch["value_goals"] = self.get_observations(value_goal_idxs)
             batch["actor_goals"] = self.get_observations(actor_goal_idxs)
         batch["value_goal_observations"] = self.get_observations(value_goal_idxs)
-        batch["actor_goal_observations"] = self.get_observations(value_goal_idxs)
+        batch["actor_goal_observations"] = self.get_observations(actor_goal_idxs)
         successes = (idxs == value_goal_idxs).astype(float)
         batch["masks"] = 1.0 - successes
         batch["rewards"] = successes - (1.0 if dataset_config["gc_negative"] else 0.0)
@@ -440,6 +440,184 @@ class GCDataset:
             batch["value_next_goals"] = self.get_observations(idxs + 1)
             batch["value_random_goals"] = self.get_observations(random_goal_idxs)
             batch["value_hard_neg_goals"] = self.get_observations(hard_neg_goal_idxs)
+
+        self.add_bmm_supervised_fields(batch, budgets)
+        self.add_bmm_rank_fields(batch, budgets)
+
+    def get_goal_vectors(self, idxs):
+        """Return goals in the same vector representation as value_goals."""
+        if "oracle_reps" in self.dataset:
+            return self.dataset["oracle_reps"][idxs]
+        return self.get_observations(idxs)
+
+    def add_bmm_supervised_fields(self, batch, budgets):
+        """Add balanced per-budget supervised reachability pairs."""
+        batch_size = len(batch["actions"])
+        num_pairs = int(self.config.get("num_sup_pairs", 0))
+        if num_pairs <= 0:
+            return
+
+        valid_idxs = self.dataset.valid_idxs.astype(np.int32)
+        valid_remaining = (
+            self.terminal_locs[np.searchsorted(self.terminal_locs, valid_idxs)]
+            - valid_idxs
+        ).astype(np.int32)
+        pos_boundary_frac = float(self.config.get("sup_pos_boundary_frac", 0.5))
+        neg_min_factor = float(self.config.get("sup_neg_min_factor", 1.0))
+        neg_max_factor = float(self.config.get("sup_neg_max_factor", 2.0))
+        include_far_negs = bool(self.config.get("sup_include_far_negs", True))
+
+        fallback_idx = int(valid_idxs[0])
+        source_idxs = np.full((num_pairs, batch_size), fallback_idx, dtype=np.int32)
+        goal_idxs = np.full((num_pairs, batch_size), fallback_idx + 1, dtype=np.int32)
+        sup_budgets = np.zeros((num_pairs, batch_size), dtype=np.int32)
+        sup_offsets = np.ones((num_pairs, batch_size), dtype=np.int32)
+        sup_labels = np.zeros((num_pairs, batch_size), dtype=np.float32)
+        sup_valids = np.zeros((num_pairs, batch_size), dtype=np.float32)
+
+        pos_eligible = {}
+        neg_eligible = {}
+        for budget in budgets:
+            budget = int(budget)
+            min_pos_remaining = max(1, int(np.ceil(pos_boundary_frac * budget)))
+            eligible = valid_idxs[valid_remaining >= min_pos_remaining]
+            if len(eligible) == 0:
+                eligible = valid_idxs[valid_remaining >= 1]
+            pos_eligible[budget] = eligible
+            neg_eligible[budget] = valid_idxs[valid_remaining >= budget + 1]
+
+        for pair_idx in range(num_pairs):
+            sampled_budgets = budgets[
+                np.random.randint(len(budgets), size=batch_size)
+            ].astype(np.int32)
+            labels = (np.random.rand(batch_size) < 0.5).astype(np.float32)
+            sup_budgets[pair_idx] = sampled_budgets
+            sup_labels[pair_idx] = labels
+
+            for budget in budgets:
+                budget = int(budget)
+                pos_cols = np.nonzero(
+                    (sampled_budgets == budget) & (labels == 1.0)
+                )[0]
+                if len(pos_cols) > 0 and len(pos_eligible[budget]) > 0:
+                    eligible = pos_eligible[budget]
+                    srcs = eligible[np.random.randint(len(eligible), size=len(pos_cols))]
+                    rem = (
+                        self.terminal_locs[np.searchsorted(self.terminal_locs, srcs)]
+                        - srcs
+                    ).astype(np.int32)
+                    hi = np.minimum(budget, rem)
+                    lo = np.minimum(
+                        max(1, int(np.ceil(pos_boundary_frac * budget))), hi
+                    )
+                    valid = hi >= 1
+                    widths = np.maximum(hi - lo + 1, 1)
+                    sampled_offsets = lo + np.floor(
+                        np.random.rand(len(pos_cols)) * widths
+                    ).astype(np.int32)
+                    cols = pos_cols[valid]
+                    source_idxs[pair_idx, cols] = srcs[valid]
+                    goal_idxs[pair_idx, cols] = srcs[valid] + sampled_offsets[valid]
+                    sup_offsets[pair_idx, cols] = sampled_offsets[valid]
+                    sup_valids[pair_idx, cols] = 1.0
+
+                neg_cols = np.nonzero(
+                    (sampled_budgets == budget) & (labels == 0.0)
+                )[0]
+                if len(neg_cols) > 0 and len(neg_eligible[budget]) > 0:
+                    eligible = neg_eligible[budget]
+                    srcs = eligible[np.random.randint(len(eligible), size=len(neg_cols))]
+                    rem = (
+                        self.terminal_locs[np.searchsorted(self.terminal_locs, srcs)]
+                        - srcs
+                    ).astype(np.int32)
+                    near_lo = max(
+                        budget + 1, int(np.floor(neg_min_factor * budget)) + 1
+                    )
+                    near_hi = np.minimum(
+                        rem, int(np.floor(neg_max_factor * budget))
+                    ).astype(np.int32)
+                    lo = np.full(len(neg_cols), near_lo, dtype=np.int32)
+                    hi = near_hi
+                    if include_far_negs:
+                        far_hi = np.minimum(rem, int(np.floor(4.0 * budget))).astype(
+                            np.int32
+                        )
+                        use_far = (np.random.rand(len(neg_cols)) < 0.25) & (
+                            far_hi > near_hi
+                        )
+                        lo = np.where(use_far, near_hi + 1, lo)
+                        hi = np.where(use_far, far_hi, hi)
+                    fallback = lo > hi
+                    lo = np.where(fallback, budget + 1, lo)
+                    hi = np.where(fallback, rem, hi)
+                    valid = lo <= hi
+                    widths = np.maximum(hi - lo + 1, 1)
+                    sampled_offsets = lo + np.floor(
+                        np.random.rand(len(neg_cols)) * widths
+                    ).astype(np.int32)
+                    cols = neg_cols[valid]
+                    source_idxs[pair_idx, cols] = srcs[valid]
+                    goal_idxs[pair_idx, cols] = srcs[valid] + sampled_offsets[valid]
+                    sup_offsets[pair_idx, cols] = sampled_offsets[valid]
+                    sup_valids[pair_idx, cols] = 1.0
+
+        batch["value_sup_observations"] = self.get_observations(source_idxs)
+        batch["value_sup_actions"] = self.dataset["actions"][source_idxs]
+        batch["value_sup_goals"] = self.get_goal_vectors(goal_idxs)
+        batch["value_sup_budgets"] = sup_budgets
+        batch["value_sup_offsets"] = sup_offsets
+        batch["value_sup_labels"] = sup_labels
+        batch["value_sup_valids"] = sup_valids
+
+    def add_bmm_rank_fields(self, batch, budgets):
+        """Add same-pair budget-threshold ranking examples."""
+        batch_size = len(batch["actions"])
+        num_pairs = int(self.config.get("num_rank_pairs", 0))
+        if num_pairs <= 0 or len(budgets) < 2:
+            return
+
+        valid_idxs = self.dataset.valid_idxs.astype(np.int32)
+        valid_remaining = (
+            self.terminal_locs[np.searchsorted(self.terminal_locs, valid_idxs)]
+            - valid_idxs
+        ).astype(np.int32)
+
+        fallback_idx = int(valid_idxs[0])
+        source_idxs = np.full((num_pairs, batch_size), fallback_idx, dtype=np.int32)
+        goal_idxs = np.full((num_pairs, batch_size), fallback_idx + 1, dtype=np.int32)
+        pos_budgets = np.zeros((num_pairs, batch_size), dtype=np.int32)
+        neg_budgets = np.zeros((num_pairs, batch_size), dtype=np.int32)
+        offsets = np.ones((num_pairs, batch_size), dtype=np.int32)
+        valids = np.zeros((num_pairs, batch_size), dtype=np.float32)
+
+        for pair_idx in range(num_pairs):
+            pos_budget_idxs = 1 + np.random.randint(
+                len(budgets) - 1, size=batch_size
+            )
+            for batch_idx, pos_budget_idx in enumerate(pos_budget_idxs):
+                h_pos = int(budgets[pos_budget_idx])
+                h_neg = int(budgets[pos_budget_idx - 1])
+                offset = h_neg + 1 + int(np.random.randint(h_pos - h_neg))
+                eligible = valid_idxs[valid_remaining >= offset]
+                pos_budgets[pair_idx, batch_idx] = h_pos
+                neg_budgets[pair_idx, batch_idx] = h_neg
+                offsets[pair_idx, batch_idx] = offset
+                if len(eligible) == 0:
+                    continue
+
+                src = int(eligible[np.random.randint(len(eligible))])
+                source_idxs[pair_idx, batch_idx] = src
+                goal_idxs[pair_idx, batch_idx] = src + offset
+                valids[pair_idx, batch_idx] = 1.0
+
+        batch["value_rank_observations"] = self.get_observations(source_idxs)
+        batch["value_rank_actions"] = self.dataset["actions"][source_idxs]
+        batch["value_rank_goals"] = self.get_goal_vectors(goal_idxs)
+        batch["value_rank_pos_budgets"] = pos_budgets
+        batch["value_rank_neg_budgets"] = neg_budgets
+        batch["value_rank_offsets"] = offsets
+        batch["value_rank_valids"] = valids
 
     def sample_goals(
         self, idxs, p_curgoal, p_trajgoal, p_randomgoal, geom_sample, discount=None

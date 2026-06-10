@@ -68,6 +68,12 @@ def main():
         "critic/loss_hard_neg",
         "critic/loss_rand_hinge",
         "critic/loss_mono",
+        "critic/loss_sup",
+        "critic/loss_rank",
+        "critic/sup_valid_frac",
+        "critic/rank_valid_frac",
+        "critic/sup_pos_count_H=1",
+        "critic/sup_neg_count_H=1",
         "actor/actor_loss",
     }
     missing = required_metrics - set(info.keys())
@@ -101,6 +107,7 @@ def main():
 
     zero_config = make_config()
     zero_config.lambda_hard_neg = 0.0
+    zero_config.lambda_rank = 0.0
     zero_dataset = GCDataset(make_fake_dataset(), zero_config)
     zero_example_batch = zero_dataset.sample(1)
     zero_batch = zero_dataset.sample(zero_config.batch_size)
@@ -108,6 +115,17 @@ def main():
     _, zero_info = zero_agent.update(zero_batch)
     assert "critic/loss_hard_neg" in zero_info
     for key, value in zero_info.items():
+        assert bool(jnp.all(jnp.isfinite(value))), f"Non-finite metric {key}: {value}"
+
+    onehot_config = make_config()
+    onehot_config.budget_feature = "log_scalar_onehot"
+    onehot_dataset = GCDataset(make_fake_dataset(), onehot_config)
+    onehot_example_batch = onehot_dataset.sample(1)
+    onehot_batch = onehot_dataset.sample(onehot_config.batch_size)
+    onehot_agent = BMMTRLAgent.create(5, onehot_example_batch, onehot_config)
+    _, onehot_info = onehot_agent.update(onehot_batch)
+    assert "critic/loss_sup" in onehot_info
+    for key, value in onehot_info.items():
         assert bool(jnp.all(jnp.isfinite(value))), f"Non-finite metric {key}: {value}"
 
     print("BMM agent update and sample_actions smoke checks passed.")

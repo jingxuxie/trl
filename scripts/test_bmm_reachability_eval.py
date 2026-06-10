@@ -15,9 +15,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from agents.bmm_trl import augment_goal_with_budget, get_config, normalize_budget
+from agents.bmm_trl import (
+    augment_goal_with_budget,
+    config_budgets,
+    get_config,
+    normalize_budget,
+)
 from scripts.bmm_reachability_utils import (
     make_pair_batch,
+    sample_balanced_budget_pairs,
     sample_fixed_offset_pairs,
     sample_random_pairs,
 )
@@ -80,6 +86,28 @@ def main():
         normalize_budget(pair_batch["budgets"], config.max_budget)
     )
     assert np.allclose(np.asarray(augmented[:, -1]), expected_budget_feature)
+
+    balanced = sample_balanced_budget_pairs(dataset, budget=4, num_pairs=32, rng=rng)
+    assert balanced is not None
+    assert np.array_equal(
+        balanced["labels"], (balanced["offsets"] <= balanced["budgets"]).astype(float)
+    )
+    assert balanced["labels"].sum() > 0
+    assert (balanced["labels"] == 0).sum() > 0
+    assert np.all(balanced["offsets"][balanced["labels"] == 1] <= 4)
+    assert np.all(balanced["offsets"][balanced["labels"] == 0] > 4)
+
+    budgets = config_budgets(config)
+    onehot_augmented = augment_goal_with_budget(
+        pair_batch["goals"],
+        pair_batch["budgets"],
+        config.max_budget,
+        budgets=budgets,
+        budget_feature="log_scalar_onehot",
+    )
+    assert onehot_augmented.shape[-1] == pair_batch["goals"].shape[-1] + 1 + len(
+        budgets
+    )
 
     print("BMM reachability diagnostic sampler checks passed.")
 

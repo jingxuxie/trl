@@ -19,6 +19,18 @@ from utils.networks import (
 BMM_DEFAULT_BUDGETS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)
 
 
+def config_budgets(config):
+    """Return sorted BMM budgets from a config-like object."""
+    budgets = tuple(int(x) for x in config.get("budgets", BMM_DEFAULT_BUDGETS))
+    max_budget = int(config.get("max_budget", max(budgets)))
+    budgets = tuple(sorted(set(x for x in budgets if 1 <= x <= max_budget)))
+    if len(budgets) == 0 or budgets[0] != 1:
+        budgets = tuple(sorted(set((1, *budgets))))
+    if budgets[-1] != max_budget:
+        budgets = tuple(sorted(set((*budgets, max_budget))))
+    return budgets
+
+
 def normalize_budget(budget, max_budget):
     """Map positive step budgets to a scalar log feature in [0, 1]."""
     budget = jnp.asarray(budget, dtype=jnp.float32)
@@ -27,8 +39,24 @@ def normalize_budget(budget, max_budget):
     return jnp.log2(budget) / denom
 
 
-def augment_goal_with_budget(goal, budget, max_budget):
-    """Append a normalized log-budget scalar to vector goals."""
+def _broadcast_budget_like_goal(value, goal):
+    if value.ndim == len(goal.shape[:-1]) + 1 and value.shape[-1] == 1:
+        value = jnp.squeeze(value, axis=-1)
+    if value.ndim == 0:
+        value = jnp.full(goal.shape[:-1], value, dtype=goal.dtype)
+    else:
+        value = jnp.broadcast_to(value, goal.shape[:-1]).astype(goal.dtype)
+    return value
+
+
+def augment_goal_with_budget(
+    goal,
+    budget,
+    max_budget,
+    budgets=None,
+    budget_feature="log_scalar",
+):
+    """Append budget features to vector goals."""
     if isinstance(goal, (dict, flax.core.FrozenDict)):
         raise ValueError("BMM-TRL first pass supports vector goals only, not dict goals.")
 
@@ -40,13 +68,25 @@ def augment_goal_with_budget(goal, budget, max_budget):
         )
 
     b = normalize_budget(budget, max_budget)
-    if b.ndim == len(goal.shape[:-1]) + 1 and b.shape[-1] == 1:
-        b = jnp.squeeze(b, axis=-1)
-    if b.ndim == 0:
-        b = jnp.full(goal.shape[:-1], b, dtype=goal.dtype)
-    else:
-        b = jnp.broadcast_to(b, goal.shape[:-1]).astype(goal.dtype)
-    return jnp.concatenate([goal, b[..., None]], axis=-1)
+    b = _broadcast_budget_like_goal(b, goal)
+    features = [goal, b[..., None]]
+
+    if budget_feature == "log_scalar_onehot":
+        if budgets is None:
+            budgets = BMM_DEFAULT_BUDGETS
+        budgets_arr = jnp.asarray(tuple(int(x) for x in budgets), dtype=jnp.float32)
+        budget_idxs = jnp.searchsorted(
+            budgets_arr, jnp.asarray(budget, dtype=jnp.float32), side="left"
+        )
+        budget_idxs = jnp.clip(budget_idxs, 0, len(tuple(budgets)) - 1)
+        budget_idxs = _broadcast_budget_like_goal(budget_idxs, goal).astype(jnp.int32)
+        features.append(
+            jax.nn.one_hot(budget_idxs, len(tuple(budgets)), dtype=goal.dtype)
+        )
+    elif budget_feature != "log_scalar":
+        raise ValueError(f"Unsupported BMM budget_feature: {budget_feature}")
+
+    return jnp.concatenate(features, axis=-1)
 
 
 def actor_budget(goals, max_budget):
@@ -55,14 +95,12 @@ def actor_budget(goals, max_budget):
 
 
 def masked_mean(x, mask, eps=1e-8):
-    """Mean of x under a batch mask for either [B] or [E, B] tensors."""
+    """Mean of x under a mask that broadcasts over leading ensemble axes."""
     mask = jnp.asarray(mask, dtype=x.dtype)
     while mask.ndim < x.ndim:
-        mask = mask[None, :]
-    denom = mask.sum()
-    if x.ndim == 2:
-        denom = denom * x.shape[0]
-    return (x * mask).sum() / (denom + eps)
+        mask = mask[None, ...]
+    mask = jnp.broadcast_to(mask, x.shape)
+    return (x * mask).sum() / (mask.sum() + eps)
 
 
 class BMMTRLAgent(flax.struct.PyTreeNode):
@@ -71,6 +109,54 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
     rng: Any
     network: Any
     config: Any = nonpytree_field()
+
+    def augment_goal(self, goal, budget):
+        return augment_goal_with_budget(
+            goal,
+            budget,
+            self.config["max_budget"],
+            budgets=config_budgets(self.config),
+            budget_feature=self.config["budget_feature"],
+        )
+
+    def critic_logits_for(self, observations, actions, goals, budgets, grad_params=None, target=False):
+        module = "target_critic" if target else "critic"
+        aug_goals = self.augment_goal(goals, budgets)
+        if grad_params is None or target:
+            return self.network.select(module)(
+                observations,
+                goals=aug_goals,
+                actions=actions,
+            )
+        return self.network.select(module)(
+            observations,
+            goals=aug_goals,
+            actions=actions,
+            params=grad_params,
+        )
+
+    def critic_logits_for_pair_grid(
+        self, observations, actions, goals, budgets, grad_params=None
+    ):
+        budgets = jnp.asarray(budgets)
+        leading_shape = budgets.shape
+        leading_ndim = budgets.ndim
+        flat_observations = jax.tree_util.tree_map(
+            lambda x: jnp.reshape(x, (-1,) + x.shape[leading_ndim:]), observations
+        )
+        flat_actions = jnp.reshape(actions, (-1,) + actions.shape[leading_ndim:])
+        flat_goals = jax.tree_util.tree_map(
+            lambda x: jnp.reshape(x, (-1,) + x.shape[leading_ndim:]), goals
+        )
+        flat_budgets = jnp.reshape(budgets, (-1,))
+        flat_logits = self.critic_logits_for(
+            flat_observations,
+            flat_actions,
+            flat_goals,
+            flat_budgets,
+            grad_params=grad_params,
+        )
+        return jnp.reshape(flat_logits, flat_logits.shape[:1] + leading_shape)
 
     @staticmethod
     def bce_loss(pred_logit, target):
@@ -84,39 +170,30 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             raise ValueError("BMM-TRL prototype does not support oracle_distill=True.")
 
         goal_key = "value_goals"
-        max_budget = self.config["max_budget"]
-        aug_value_goals = augment_goal_with_budget(
-            batch[goal_key], batch["value_budgets"], max_budget
-        )
-        r_logits = self.network.select("critic")(
+        r_logits = self.critic_logits_for(
             batch["observations"],
-            goals=aug_value_goals,
-            actions=batch["actions"],
-            params=grad_params,
+            batch["actions"],
+            batch[goal_key],
+            batch["value_budgets"],
+            grad_params=grad_params,
         )
         r = jax.nn.sigmoid(r_logits)
 
-        aug_midpoint_goals = augment_goal_with_budget(
+        first_logits = self.critic_logits_for(
+            batch["observations"],
+            batch["actions"],
             batch["value_midpoint_goals"],
             batch["value_left_budgets"],
-            max_budget,
-        )
-        first_logits = self.network.select("target_critic")(
-            batch["observations"],
-            goals=aug_midpoint_goals,
-            actions=batch["actions"],
+            target=True,
         )
         first_r = jax.nn.sigmoid(first_logits)
 
-        aug_right_goals = augment_goal_with_budget(
+        second_logits = self.critic_logits_for(
+            batch["value_midpoint_observations"],
+            batch["value_midpoint_actions"],
             batch[goal_key],
             batch["value_right_budgets"],
-            max_budget,
-        )
-        second_logits = self.network.select("target_critic")(
-            batch["value_midpoint_observations"],
-            goals=aug_right_goals,
-            actions=batch["value_midpoint_actions"],
+            target=True,
         )
         second_r = jax.nn.sigmoid(second_logits)
 
@@ -126,14 +203,12 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
         )
         loss_pos = self.bce_loss(r_logits, jnp.ones_like(r_logits)).mean()
 
-        aug_neg_goals = augment_goal_with_budget(
-            batch[goal_key], batch["value_neg_budgets"], max_budget
-        )
-        neg_logits = self.network.select("critic")(
+        neg_logits = self.critic_logits_for(
             batch["observations"],
-            goals=aug_neg_goals,
-            actions=batch["actions"],
-            params=grad_params,
+            batch["actions"],
+            batch[goal_key],
+            batch["value_neg_budgets"],
+            grad_params=grad_params,
         )
         neg_r = jax.nn.sigmoid(neg_logits)
         loss_budget_neg = masked_mean(
@@ -141,14 +216,12 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             batch["value_neg_valids"],
         )
 
-        aug_hard_neg_goals = augment_goal_with_budget(
-            batch["value_hard_neg_goals"], batch["value_hard_neg_budgets"], max_budget
-        )
-        hard_neg_logits = self.network.select("critic")(
+        hard_neg_logits = self.critic_logits_for(
             batch["observations"],
-            goals=aug_hard_neg_goals,
-            actions=batch["actions"],
-            params=grad_params,
+            batch["actions"],
+            batch["value_hard_neg_goals"],
+            batch["value_hard_neg_budgets"],
+            grad_params=grad_params,
         )
         hard_neg_r = jax.nn.sigmoid(hard_neg_logits)
         loss_hard_neg = masked_mean(
@@ -156,41 +229,83 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             batch["value_hard_neg_valids"],
         )
 
-        aug_rand_goals = augment_goal_with_budget(
-            batch["value_random_goals"], batch["value_random_budgets"], max_budget
-        )
-        rand_logits = self.network.select("critic")(
+        rand_logits = self.critic_logits_for(
             batch["observations"],
-            goals=aug_rand_goals,
-            actions=batch["actions"],
-            params=grad_params,
+            batch["actions"],
+            batch["value_random_goals"],
+            batch["value_random_budgets"],
+            grad_params=grad_params,
         )
         rand_r = jax.nn.sigmoid(rand_logits)
         loss_rand_hinge = jnp.mean(
             jnp.maximum(rand_r - self.config["rand_hinge_rho"], 0.0) ** 2
         )
 
-        aug_low_goals = augment_goal_with_budget(
-            batch[goal_key], batch["mono_low_budgets"], max_budget
-        )
-        aug_high_goals = augment_goal_with_budget(
-            batch[goal_key], batch["mono_high_budgets"], max_budget
-        )
-        low_logits = self.network.select("critic")(
+        low_logits = self.critic_logits_for(
             batch["observations"],
-            goals=aug_low_goals,
-            actions=batch["actions"],
-            params=grad_params,
+            batch["actions"],
+            batch[goal_key],
+            batch["mono_low_budgets"],
+            grad_params=grad_params,
         )
-        high_logits = self.network.select("critic")(
+        high_logits = self.critic_logits_for(
             batch["observations"],
-            goals=aug_high_goals,
-            actions=batch["actions"],
-            params=grad_params,
+            batch["actions"],
+            batch[goal_key],
+            batch["mono_high_budgets"],
+            grad_params=grad_params,
         )
         low_r = jax.nn.sigmoid(low_logits)
         high_r = jax.nn.sigmoid(high_logits)
         loss_mono = jnp.mean(jnp.maximum(low_r - high_r, 0.0) ** 2)
+
+        if "value_sup_goals" in batch:
+            sup_logits = self.critic_logits_for_pair_grid(
+                batch["value_sup_observations"],
+                batch["value_sup_actions"],
+                batch["value_sup_goals"],
+                batch["value_sup_budgets"],
+                grad_params=grad_params,
+            )
+            sup_labels = jnp.asarray(batch["value_sup_labels"], dtype=sup_logits.dtype)
+            sup_valids = jnp.asarray(batch["value_sup_valids"], dtype=sup_logits.dtype)
+            sup_r = jax.nn.sigmoid(sup_logits)
+            loss_sup = masked_mean(self.bce_loss(sup_logits, sup_labels), sup_valids)
+        else:
+            sup_logits = jnp.zeros((1, 1, 1), dtype=r_logits.dtype)
+            sup_labels = jnp.zeros((1, 1), dtype=r_logits.dtype)
+            sup_valids = jnp.zeros((1, 1), dtype=r_logits.dtype)
+            sup_r = jnp.zeros_like(sup_logits)
+            loss_sup = jnp.asarray(0.0, dtype=r_logits.dtype)
+
+        if "value_rank_goals" in batch:
+            rank_pos_logits = self.critic_logits_for_pair_grid(
+                batch["value_rank_observations"],
+                batch["value_rank_actions"],
+                batch["value_rank_goals"],
+                batch["value_rank_pos_budgets"],
+                grad_params=grad_params,
+            )
+            rank_neg_logits = self.critic_logits_for_pair_grid(
+                batch["value_rank_observations"],
+                batch["value_rank_actions"],
+                batch["value_rank_goals"],
+                batch["value_rank_neg_budgets"],
+                grad_params=grad_params,
+            )
+            rank_valids = jnp.asarray(
+                batch["value_rank_valids"], dtype=rank_pos_logits.dtype
+            )
+            rank_gap = rank_pos_logits - rank_neg_logits
+            loss_rank = masked_mean(
+                jax.nn.softplus(self.config["rank_margin"] - rank_gap), rank_valids
+            )
+            rank_gap_mean = masked_mean(rank_gap, rank_valids)
+        else:
+            rank_valids = jnp.zeros((1, 1), dtype=r_logits.dtype)
+            rank_gap = jnp.zeros((1, 1, 1), dtype=r_logits.dtype)
+            loss_rank = jnp.asarray(0.0, dtype=r_logits.dtype)
+            rank_gap_mean = jnp.asarray(0.0, dtype=r_logits.dtype)
 
         total_loss = (
             self.config["lambda_trans"] * loss_trans
@@ -199,6 +314,8 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             + self.config["lambda_hard_neg"] * loss_hard_neg
             + self.config["lambda_rand_hinge"] * loss_rand_hinge
             + self.config["lambda_mono"] * loss_mono
+            + self.config["lambda_sup"] * loss_sup
+            + self.config["lambda_rank"] * loss_rank
         )
 
         hard_neg_budgets = jnp.asarray(
@@ -212,7 +329,7 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             hard_neg_budgets, 1.0
         )
 
-        return total_loss, {
+        info = {
             "total_loss": total_loss,
             "loss_trans": loss_trans,
             "loss_pos": loss_pos,
@@ -220,6 +337,8 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             "loss_hard_neg": loss_hard_neg,
             "loss_rand_hinge": loss_rand_hinge,
             "loss_mono": loss_mono,
+            "loss_sup": loss_sup,
+            "loss_rank": loss_rank,
             "r_mean": r.mean(),
             "r_min": r.min(),
             "r_max": r.max(),
@@ -239,7 +358,31 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             "hard_neg_offset_over_budget_mean": masked_mean(
                 hard_neg_offset_over_budget, hard_neg_valids
             ),
+            "sup_r_mean": masked_mean(sup_r, sup_valids),
+            "sup_pos_r_mean": masked_mean(sup_r, sup_valids * sup_labels),
+            "sup_neg_r_mean": masked_mean(sup_r, sup_valids * (1.0 - sup_labels)),
+            "sup_valid_frac": sup_valids.mean(),
+            "sup_pos_frac": masked_mean(sup_labels, sup_valids),
+            "rank_gap_mean": rank_gap_mean,
+            "rank_valid_frac": rank_valids.mean(),
         }
+
+        if "value_sup_goals" in batch:
+            for budget in config_budgets(self.config):
+                budget_mask = (
+                    jnp.asarray(batch["value_sup_budgets"]) == int(budget)
+                ).astype(sup_valids.dtype)
+                pos_mask = sup_valids * budget_mask * sup_labels
+                neg_mask = sup_valids * budget_mask * (1.0 - sup_labels)
+                info[f"sup_pos_count_H={int(budget)}"] = pos_mask.sum()
+                info[f"sup_neg_count_H={int(budget)}"] = neg_mask.sum()
+                info[f"sup_pos_r_mean_H={int(budget)}"] = masked_mean(sup_r, pos_mask)
+                info[f"sup_neg_r_mean_H={int(budget)}"] = masked_mean(sup_r, neg_mask)
+                info[f"sup_valid_frac_H={int(budget)}"] = (
+                    sup_valids * budget_mask
+                ).mean()
+
+        return total_loss, info
 
     def actor_loss(self, batch, grad_params, rng=None):
         """Compute the actor loss."""
@@ -254,10 +397,9 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             else:
                 q_actions = jnp.clip(dist.sample(seed=rng), -1, 1)
 
-            aug_actor_goals = augment_goal_with_budget(
+            aug_actor_goals = self.augment_goal(
                 batch["actor_goals"],
                 actor_budget(batch["actor_goals"], self.config["max_budget"]),
-                self.config["max_budget"],
             )
             q1, q2 = self.network.select("critic")(
                 batch["observations"], aug_actor_goals, q_actions
@@ -296,10 +438,9 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             n_goals = jnp.repeat(
                 jnp.expand_dims(batch["actor_goals"], 0), pe_info["action_ct"], axis=0
             )
-            aug_n_goals = augment_goal_with_budget(
+            aug_n_goals = self.augment_goal(
                 n_goals,
                 actor_budget(n_goals, self.config["max_budget"]),
-                self.config["max_budget"],
             )
 
             q = self.network.select("critic")(n_obs, aug_n_goals, n_actions).mean(axis=0)
@@ -416,10 +557,9 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
                 n_actions = n_actions + vels / pe_info["flow_steps"]
             n_actions = jnp.clip(n_actions, -1, 1)
 
-            aug_n_goals = augment_goal_with_budget(
+            aug_n_goals = self.augment_goal(
                 n_goals,
                 actor_budget(n_goals, self.config["max_budget"]),
-                self.config["max_budget"],
             )
             q = self.network.select("critic")(
                 n_observations, goals=aug_n_goals, actions=n_actions
@@ -455,8 +595,11 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
     ):
         if config["oracle_distill"]:
             raise ValueError("BMM-TRL prototype does not support oracle_distill=True.")
-        if config["budget_feature"] != "log_scalar":
-            raise ValueError("BMM-TRL prototype only supports budget_feature='log_scalar'.")
+        if config["budget_feature"] not in ("log_scalar", "log_scalar_onehot"):
+            raise ValueError(
+                "BMM-TRL supports budget_feature='log_scalar' or "
+                "'log_scalar_onehot'."
+            )
         if config["split_mode"] != "half":
             raise ValueError("BMM-TRL prototype only supports split_mode='half'.")
 
@@ -512,6 +655,8 @@ class BMMTRLAgent(flax.struct.PyTreeNode):
             ex_goals,
             actor_budget(ex_goals, config["max_budget"]),
             config["max_budget"],
+            budgets=config_budgets(config),
+            budget_feature=config["budget_feature"],
         )
         network_info = dict(
             critic=(critic_def, (ex_observations, ex_critic_goals, ex_actions)),
@@ -563,15 +708,24 @@ def get_config():
             split_min_frac=0.25,
             num_split_samples=1,
             num_witnesses=1,
-            lambda_trans=0.25,
-            lambda_pos=1.0,
-            lambda_budget_neg=0.1,
-            lambda_hard_neg=0.5,
-            lambda_rand_hinge=0.05,
-            lambda_mono=0.1,
+            lambda_trans=0.0,
+            lambda_pos=0.0,
+            lambda_budget_neg=0.0,
+            lambda_hard_neg=0.0,
+            lambda_rand_hinge=0.0,
+            lambda_mono=0.05,
+            lambda_sup=1.0,
+            lambda_rank=0.5,
+            num_sup_pairs=8,
+            num_rank_pairs=8,
+            rank_margin=1.0,
             budget_neg_frac=0.5,
             hard_neg_min_factor=1.25,
             hard_neg_max_factor=4.0,
+            sup_pos_boundary_frac=0.5,
+            sup_neg_min_factor=1.0,
+            sup_neg_max_factor=2.0,
+            sup_include_far_negs=True,
             rand_hinge_rho=0.3,
             actor_budget_mode="max",
             actor_budget_threshold=0.5,

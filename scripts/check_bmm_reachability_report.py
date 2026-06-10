@@ -25,6 +25,8 @@ def check_report(
     if max_budget is None:
         budgets = report.get("budgets", [])
         max_budget = max(budgets) if budgets else float("inf")
+    rows = report.get("balanced_budget_rows") or report.get("budget_rows", [])
+    using_balanced = bool(report.get("balanced_budget_rows"))
 
     for key in ("mean_monotonicity_violation", "min_monotonicity_violation"):
         if key not in report:
@@ -35,46 +37,72 @@ def check_report(
         elif float(value) > max_mono:
             failures.append(f"{key}={float(value):.4f} exceeds {max_mono:.4f}")
 
-    for row in report.get("budget_rows", []):
+    for row in rows:
         budget = int(row["budget"])
         if budget > max_budget:
             skipped.append(f"H={budget}: above max_budget={max_budget}")
             continue
 
-        metrics = row["mean"]
-        pos_count = int(metrics.get("pos_count", 0))
-        neg_count = int(metrics.get("neg_count", 0))
-        if pos_count == 0 or neg_count == 0:
-            skipped.append(
-                f"H={budget}: one-class labels (pos={pos_count}, neg={neg_count})"
-            )
-            continue
+        budget_min_auc, budget_min_gap = thresholds_for_budget(
+            budget, min_auc, min_gap, using_balanced
+        )
+        for metric_name in ("mean", "ensemble_min"):
+            metrics = row.get(metric_name, {})
+            pos_count = int(metrics.get("pos_count", 0))
+            neg_count = int(metrics.get("neg_count", 0))
+            if pos_count == 0 or neg_count == 0:
+                skipped.append(
+                    f"H={budget} {metric_name}: one-class labels "
+                    f"(pos={pos_count}, neg={neg_count})"
+                )
+                continue
 
-        auc = metrics.get("auc")
-        pos_mean = metrics.get("pos_mean")
-        neg_mean = metrics.get("neg_mean")
-        for name, value in (
-            ("auc", auc),
-            ("pos_mean", pos_mean),
-            ("neg_mean", neg_mean),
-        ):
-            if not is_finite(value):
-                failures.append(f"H={budget}: {name} is non-finite: {value}")
+            auc = metrics.get("auc")
+            pos_mean = metrics.get("pos_mean")
+            neg_mean = metrics.get("neg_mean")
+            for name, value in (
+                ("auc", auc),
+                ("pos_mean", pos_mean),
+                ("neg_mean", neg_mean),
+            ):
+                if not is_finite(value):
+                    failures.append(
+                        f"H={budget} {metric_name}: {name} is non-finite: {value}"
+                    )
 
-        if not all(is_finite(value) for value in (auc, pos_mean, neg_mean)):
-            continue
+            if not all(is_finite(value) for value in (auc, pos_mean, neg_mean)):
+                continue
 
-        gap = float(pos_mean) - float(neg_mean)
-        if float(auc) < min_auc:
-            failures.append(f"H={budget}: auc={float(auc):.4f} below {min_auc:.4f}")
-        if gap < min_gap:
-            failures.append(f"H={budget}: pos-neg gap={gap:.4f} below {min_gap:.4f}")
-        if float(neg_mean) > max_neg_mean:
-            failures.append(
-                f"H={budget}: neg_mean={float(neg_mean):.4f} exceeds {max_neg_mean:.4f}"
-            )
+            gap = float(pos_mean) - float(neg_mean)
+            if float(auc) < budget_min_auc:
+                failures.append(
+                    f"H={budget} {metric_name}: auc={float(auc):.4f} "
+                    f"below {budget_min_auc:.4f}"
+                )
+            if gap < budget_min_gap:
+                failures.append(
+                    f"H={budget} {metric_name}: pos-neg gap={gap:.4f} "
+                    f"below {budget_min_gap:.4f}"
+                )
+            if float(neg_mean) > max_neg_mean:
+                failures.append(
+                    f"H={budget} {metric_name}: neg_mean={float(neg_mean):.4f} "
+                    f"exceeds {max_neg_mean:.4f}"
+                )
 
     return failures, skipped
+
+
+def thresholds_for_budget(budget, min_auc, min_gap, using_balanced):
+    if not using_balanced:
+        return min_auc, min_gap
+    if budget <= 128:
+        return 0.90, 0.20
+    if budget == 256:
+        return 0.85, 0.15
+    if budget >= 512:
+        return 0.80, 0.10
+    return min_auc, min_gap
 
 
 def parse_args():
@@ -84,7 +112,7 @@ def parse_args():
     parser.add_argument("--min_auc", type=float, default=0.75)
     parser.add_argument("--min_gap", type=float, default=0.10)
     parser.add_argument("--max_neg_mean", type=float, default=0.80)
-    parser.add_argument("--max_mono", type=float, default=0.15)
+    parser.add_argument("--max_mono", type=float, default=0.05)
     return parser.parse_args()
 
 

@@ -73,6 +73,74 @@ def make_pair_batch(gc_dataset, idxs, goal_idxs, offsets, budget):
     )
 
 
+def sample_balanced_budget_pairs(
+    gc_dataset,
+    budget,
+    num_pairs,
+    rng,
+    pos_boundary_frac=0.5,
+    neg_max_factor=2.0,
+):
+    """Sample near-boundary positives and negatives for one budget."""
+    valid_idxs = gc_dataset.dataset.valid_idxs
+    remaining = trajectory_remaining(gc_dataset, valid_idxs)
+    budget = int(budget)
+
+    num_pos = num_pairs // 2
+    num_neg = num_pairs - num_pos
+    srcs = []
+    goals = []
+    offsets = []
+
+    min_pos_remaining = max(1, int(np.ceil(pos_boundary_frac * budget)))
+    pos_eligible = valid_idxs[remaining >= min_pos_remaining]
+    if len(pos_eligible) == 0:
+        pos_eligible = valid_idxs[remaining >= 1]
+
+    for _ in range(num_pos):
+        if len(pos_eligible) == 0:
+            break
+        src = int(rng.choice(pos_eligible))
+        rem = int(trajectory_remaining(gc_dataset, np.asarray([src]))[0])
+        hi = min(budget, rem)
+        if hi < 1:
+            continue
+        lo = max(1, int(np.ceil(pos_boundary_frac * budget)))
+        lo = min(lo, hi)
+        offset = int(rng.integers(lo, hi + 1))
+        srcs.append(src)
+        goals.append(src + offset)
+        offsets.append(offset)
+
+    neg_eligible = valid_idxs[remaining >= budget + 1]
+    for _ in range(num_neg):
+        if len(neg_eligible) == 0:
+            break
+        src = int(rng.choice(neg_eligible))
+        rem = int(trajectory_remaining(gc_dataset, np.asarray([src]))[0])
+        lo = budget + 1
+        hi = min(rem, int(np.floor(neg_max_factor * budget)))
+        if lo > hi:
+            hi = rem
+        if lo > hi:
+            continue
+        offset = int(rng.integers(lo, hi + 1))
+        srcs.append(src)
+        goals.append(src + offset)
+        offsets.append(offset)
+
+    if len(srcs) == 0:
+        return None
+
+    return make_pair_batch(
+        gc_dataset,
+        np.asarray(srcs, dtype=np.int32),
+        np.asarray(goals, dtype=np.int32),
+        np.asarray(offsets, dtype=np.int32),
+        budget,
+    )
+
+
 def score_pair_batch(agent, pair_batch, batch_size=8192):
     """Score diagnostic pairs with mean and min ensemble sigmoid scores."""
     mean_scores = []
@@ -86,7 +154,13 @@ def score_pair_batch(agent, pair_batch, batch_size=8192):
         actions = pair_batch["actions"][start:end]
         goals = pair_batch["goals"][start:end]
         budgets = pair_batch["budgets"][start:end]
-        aug_goals = augment_goal_with_budget(goals, budgets, max_budget)
+        aug_goals = augment_goal_with_budget(
+            goals,
+            budgets,
+            max_budget,
+            budgets=get_bmm_budgets(agent.config),
+            budget_feature=agent.config.get("budget_feature", "log_scalar"),
+        )
         logits = agent.network.select("critic")(
             observations,
             goals=aug_goals,
@@ -147,9 +221,12 @@ def evaluate_reachability(
     agent,
     gc_dataset,
     num_pairs=4096,
+    balanced_pairs=4096,
     score_batch_size=8192,
     max_offset_factor=4,
     bucket_samples=512,
+    balanced_pos_boundary_frac=0.5,
+    balanced_neg_max_factor=2.0,
     rng=None,
 ):
     """Evaluate budget-conditioned reachability on validation trajectory pairs."""
@@ -162,6 +239,7 @@ def evaluate_reachability(
     )
 
     budget_rows = []
+    balanced_budget_rows = []
     mean_score_by_budget = []
     min_score_by_budget = []
     for budget in budgets:
@@ -179,6 +257,29 @@ def evaluate_reachability(
         )
         mean_score_by_budget.append(mean_scores)
         min_score_by_budget.append(min_scores)
+
+        balanced_batch = sample_balanced_budget_pairs(
+            gc_dataset,
+            int(budget),
+            balanced_pairs,
+            rng,
+            pos_boundary_frac=balanced_pos_boundary_frac,
+            neg_max_factor=balanced_neg_max_factor,
+        )
+        if balanced_batch is not None:
+            balanced_mean_scores, balanced_min_scores = score_pair_batch(
+                agent, balanced_batch, score_batch_size
+            )
+            balanced_labels = balanced_batch["labels"]
+            balanced_budget_rows.append(
+                dict(
+                    budget=int(budget),
+                    mean=binary_metrics(balanced_mean_scores, balanced_labels),
+                    ensemble_min=binary_metrics(
+                        balanced_min_scores, balanced_labels
+                    ),
+                )
+            )
 
     mean_matrix = np.stack(mean_score_by_budget, axis=0)
     min_matrix = np.stack(min_score_by_budget, axis=0)
@@ -218,9 +319,11 @@ def evaluate_reachability(
         budgets=[int(x) for x in budgets],
         max_offset=max_offset,
         random_pair_count=int(num_pairs),
+        balanced_pair_count=int(balanced_pairs),
         mean_monotonicity_violation=mean_mono,
         min_monotonicity_violation=min_mono,
         budget_rows=budget_rows,
+        balanced_budget_rows=balanced_budget_rows,
         bucket_rows=bucket_rows,
     )
 
