@@ -106,6 +106,17 @@ flags.DEFINE_float(
     0.0,
     "Q/V max-min transitive loss weight using a frozen state-value teacher.",
 )
+flags.DEFINE_enum(
+    "qv_trans_loss_type",
+    "bce_equal",
+    ["bce_equal", "prob_hinge", "bce_lower_bound"],
+    "Q/V transitive loss: equality BCE or lower-bound consistency variants.",
+)
+flags.DEFINE_float(
+    "qv_trans_bce_margin",
+    0.0,
+    "Probability margin for gated BCE lower-bound Q/V transitive loss.",
+)
 flags.DEFINE_float(
     "trans_pos_boundary_frac",
     0.5,
@@ -774,7 +785,15 @@ def sample_grid_qv_transitive_pairs(dataset, context, split, budgets, batch_size
     )
 
 
-def qv_transitive_loss(agent, batch, grad_params, value_agent):
+def qv_transitive_loss(
+    agent,
+    batch,
+    grad_params,
+    value_agent,
+    qv_trans_loss_type,
+    qv_trans_bce_margin,
+    trans_budgets,
+):
     parent_logits = agent.critic_logits_for(
         batch["qv_observations"],
         batch["qv_actions"],
@@ -823,25 +842,87 @@ def qv_transitive_loss(agent, batch, grad_params, value_agent):
     trans_valids = (witness_valids.max(axis=0) > 0).astype(parent_logits.dtype)
     y_trans = jnp.clip(y_trans, 0.0, 1.0)
     y_trans = jnp.where(trans_valids[None, :] > 0, y_trans, 0.0)
-    loss = masked_mean(bce_loss(parent_logits, y_trans), trans_valids)
-    return loss, dict(
+    bce = bce_loss(parent_logits, y_trans)
+    target_minus_parent = y_trans - parent_r
+    if qv_trans_loss_type == "bce_equal":
+        loss_values = bce
+        loss_mask = trans_valids
+    elif qv_trans_loss_type == "prob_hinge":
+        loss_values = jnp.square(jnp.maximum(target_minus_parent, 0.0))
+        loss_mask = trans_valids
+    elif qv_trans_loss_type == "bce_lower_bound":
+        gate = jax.lax.stop_gradient(
+            (target_minus_parent > qv_trans_bce_margin).astype(parent_logits.dtype)
+        )
+        loss_values = bce
+        loss_mask = trans_valids * gate
+    else:
+        raise ValueError(f"Unsupported qv_trans_loss_type={qv_trans_loss_type}")
+    loss = masked_mean(loss_values, loss_mask)
+
+    info = dict(
         loss_qv_trans=loss,
         qv_parent_r_mean=masked_mean(parent_r, trans_valids),
         qv_y_trans_mean=masked_mean(y_trans, trans_valids),
-        qv_first_r_mean=masked_mean(first_r, witness_valids),
+        qv_target_minus_parent_mean=masked_mean(target_minus_parent, trans_valids),
+        qv_frac_y_trans_gt_parent=masked_mean(
+            (target_minus_parent > 0.0).astype(parent_logits.dtype), trans_valids
+        ),
+        qv_frac_y_trans_lt_parent=masked_mean(
+            (target_minus_parent < 0.0).astype(parent_logits.dtype), trans_valids
+        ),
+        qv_first_q_mean=masked_mean(first_r, witness_valids),
         qv_second_v_mean=masked_mean(second_r, witness_valids),
         qv_valid_frac=trans_valids.mean(),
     )
+    qv_budgets = jnp.asarray(batch["qv_budgets"], dtype=parent_logits.dtype)
+    for budget in tuple(int(x) for x in trans_budgets):
+        budget_key = f"H{budget}"
+        parent_budget_mask = trans_valids * (qv_budgets == float(budget)).astype(
+            parent_logits.dtype
+        )
+        witness_budget_mask = witness_valids * (
+            qv_budgets[None, :] == float(budget)
+        ).astype(first_r.dtype)
+        info[f"loss_qv_trans_by_budget/{budget_key}"] = masked_mean(
+            loss_values, parent_budget_mask
+        )
+        info[f"qv_y_trans_mean_by_budget/{budget_key}"] = masked_mean(
+            y_trans, parent_budget_mask
+        )
+        info[f"qv_parent_r_mean_by_budget/{budget_key}"] = masked_mean(
+            parent_r, parent_budget_mask
+        )
+        info[f"qv_first_q_mean_by_budget/{budget_key}"] = masked_mean(
+            first_r, witness_budget_mask
+        )
+        info[f"qv_second_v_mean_by_budget/{budget_key}"] = masked_mean(
+            second_r, witness_budget_mask
+        )
+    return loss, info
 
 
-@jax.jit
-def update_with_qv_trans(agent, batch, value_agent, lambda_qv_trans):
+def update_with_qv_trans(
+    agent,
+    batch,
+    value_agent,
+    lambda_qv_trans,
+    qv_trans_loss_type="bce_equal",
+    qv_trans_bce_margin=0.0,
+    trans_budgets=(),
+):
     new_rng, rng = jax.random.split(agent.rng)
 
     def loss_fn(grad_params):
         critic_loss, critic_info = agent.critic_loss(batch, grad_params)
         qv_loss, qv_info = qv_transitive_loss(
-            agent, batch, grad_params, value_agent
+            agent,
+            batch,
+            grad_params,
+            value_agent,
+            qv_trans_loss_type,
+            qv_trans_bce_margin,
+            trans_budgets,
         )
         loss = critic_loss + lambda_qv_trans * qv_loss
         info = {f"critic/{key}": value for key, value in critic_info.items()}
@@ -853,6 +934,12 @@ def update_with_qv_trans(agent, batch, value_agent, lambda_qv_trans):
     new_network, info = agent.network.apply_loss_fn(loss_fn=loss_fn)
     agent.target_update(new_network, "critic")
     return agent.replace(network=new_network, rng=new_rng), info
+
+
+update_with_qv_trans = jax.jit(
+    update_with_qv_trans,
+    static_argnames=("qv_trans_loss_type", "trans_budgets"),
+)
 
 
 def rank_correlation(x, y):
@@ -1122,6 +1209,14 @@ def print_qv_summary(summary, info):
         f"mode={summary['trans_witness_mode']} | "
         f"loss={format_metric(info.get('critic/loss_qv_trans', np.nan))}"
     )
+    print(
+        "qv_target | "
+        f"parent={format_metric(info.get('critic/qv_parent_r_mean', np.nan))} | "
+        f"target={format_metric(info.get('critic/qv_y_trans_mean', np.nan))} | "
+        f"target-parent={format_metric(info.get('critic/qv_target_minus_parent_mean', np.nan))} | "
+        f"gt_parent={format_metric(info.get('critic/qv_frac_y_trans_gt_parent', np.nan))} | "
+        f"lt_parent={format_metric(info.get('critic/qv_frac_y_trans_lt_parent', np.nan))}"
+    )
     print("H | parents | parent_d | left_d | right_d | eff_K | repl | zero_l | zero_r")
     print("--|---------|----------|--------|---------|-------|------|--------|-------")
     for row in summary["budget_rows"]:
@@ -1205,6 +1300,8 @@ def main(_):
     print(f"  budgets: {budgets}")
     print(f"  trans_budgets: {trans_budgets}")
     print(f"  lambda_qv_trans: {FLAGS.lambda_qv_trans}")
+    print(f"  qv_trans_loss_type: {FLAGS.qv_trans_loss_type}")
+    print(f"  qv_trans_bce_margin: {FLAGS.qv_trans_bce_margin}")
     print(f"  num_trans_witnesses: {FLAGS.num_trans_witnesses}")
     print(f"  trans_witness_mode: {FLAGS.trans_witness_mode}")
     print(f"  sup_pairs_per_budget: {sup_pairs_per_budget}")
@@ -1281,7 +1378,13 @@ def main(_):
         )
         if FLAGS.lambda_qv_trans > 0.0:
             agent, info = update_with_qv_trans(
-                agent, train_batch, value_agent, FLAGS.lambda_qv_trans
+                agent,
+                train_batch,
+                value_agent,
+                FLAGS.lambda_qv_trans,
+                qv_trans_loss_type=FLAGS.qv_trans_loss_type,
+                qv_trans_bce_margin=FLAGS.qv_trans_bce_margin,
+                trans_budgets=trans_budgets,
             )
         else:
             agent, info = agent.update(train_batch)
@@ -1326,6 +1429,8 @@ def main(_):
             eval_interval=int(FLAGS.eval_interval),
             final_loss_sup=final_loss,
             lambda_qv_trans=float(FLAGS.lambda_qv_trans),
+            qv_trans_loss_type=str(FLAGS.qv_trans_loss_type),
+            qv_trans_bce_margin=float(FLAGS.qv_trans_bce_margin),
             trans_pos_boundary_frac=float(FLAGS.trans_pos_boundary_frac),
             num_trans_witnesses=int(FLAGS.num_trans_witnesses),
             trans_witness_mode=str(FLAGS.trans_witness_mode),

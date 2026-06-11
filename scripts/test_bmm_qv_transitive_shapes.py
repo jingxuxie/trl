@@ -120,16 +120,36 @@ def main():
     assert np.all(batch["qv_right_distances"][batch["qv_valids"] > 0] <= 2.0)
     assert np.all(batch["qv_effective_unique_witness_counts"] >= 1.0)
 
-    agent, info = qdiag.update_with_qv_trans(agent, batch, value_agent, 1.0)
-    for key in (
-        "critic/loss_sup",
-        "critic/loss_qv_trans",
-        "critic/qv_valid_frac",
-        "critic/qv_y_trans_mean",
-        "critic/total_loss_with_qv",
-    ):
-        assert key in info, f"Missing Q/V metric {key}"
-        assert bool(jnp.all(jnp.isfinite(info[key]))), (key, info[key])
+    for loss_type in ("bce_equal", "prob_hinge", "bce_lower_bound"):
+        agent, info = qdiag.update_with_qv_trans(
+            agent,
+            batch,
+            value_agent,
+            1.0,
+            qv_trans_loss_type=loss_type,
+            qv_trans_bce_margin=0.0,
+            trans_budgets=(4,),
+        )
+        for key in (
+            "critic/loss_sup",
+            "critic/loss_qv_trans",
+            "critic/qv_valid_frac",
+            "critic/qv_y_trans_mean",
+            "critic/qv_parent_r_mean",
+            "critic/qv_target_minus_parent_mean",
+            "critic/qv_frac_y_trans_gt_parent",
+            "critic/qv_frac_y_trans_lt_parent",
+            "critic/qv_first_q_mean",
+            "critic/qv_second_v_mean",
+            "critic/loss_qv_trans_by_budget/H4",
+            "critic/qv_y_trans_mean_by_budget/H4",
+            "critic/qv_parent_r_mean_by_budget/H4",
+            "critic/qv_first_q_mean_by_budget/H4",
+            "critic/qv_second_v_mean_by_budget/H4",
+            "critic/total_loss_with_qv",
+        ):
+            assert key in info, f"Missing {loss_type} Q/V metric {key}"
+            assert bool(jnp.all(jnp.isfinite(info[key]))), (key, info[key])
 
     summary = qdiag.summarize_qv_transitive_batch(qv_fields, budgets=(4,))
     assert summary["budget_rows"][0]["effective_unique_witness_count_mean"] >= 1.0
