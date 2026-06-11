@@ -27,6 +27,35 @@ def parse_int_list(value):
     return [int(part.strip()) for part in value.split(",") if part.strip()]
 
 
+def parse_str_list(value):
+    value = str(value).strip()
+    if not value:
+        return []
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def normalize_selector(name):
+    key = str(name).strip().lower().replace("-", "_")
+    aliases = {
+        "random": "random",
+        "geometric": "geometric_midpoint",
+        "geometric_midpoint": "geometric_midpoint",
+        "bmm": "BMM_V",
+        "bmm_v": "BMM_V",
+        "bmm_v_value": "BMM_V",
+        "value": "BMM_V",
+        "oracle": "oracle_midpoint",
+        "oracle_midpoint": "oracle_midpoint",
+        "oracle_state_midpoint": "oracle_midpoint",
+    }
+    if key not in aliases:
+        raise ValueError(
+            f"Unknown selector '{name}'. Expected one of: "
+            "random, geometric_midpoint, BMM_V, oracle_midpoint."
+        )
+    return aliases[key]
+
+
 def finite_mean(values):
     values = np.asarray(values, dtype=np.float32)
     values = values[np.isfinite(values)]
@@ -46,6 +75,7 @@ class ValueSubgoalNNPolicy:
         num_subgoal_candidates,
         rng,
         score_batch_size,
+        selector="BMM_V",
     ):
         self.value_agent = value_agent
         self.train_dataset = train_dataset
@@ -68,6 +98,7 @@ class ValueSubgoalNNPolicy:
         self.controller = ctl.make_nn_controller_context(
             train_dataset, context, controller_hops
         )
+        self.selector = normalize_selector(selector)
         self.maze_unit = float(maze_env._maze_unit)
         self.offset_x = float(maze_env._offset_x)
         self.offset_y = float(maze_env._offset_y)
@@ -108,14 +139,16 @@ class ValueSubgoalNNPolicy:
             )
         return np.asarray(chosen[: self.num_subgoal_candidates], dtype=np.int32)
 
-    def score_subgoals(self, observation, goal, candidate_cells):
+    def subgoals_for_cells(self, candidate_cells):
         subgoal_idxs = [
             int(self.rng.choice(self.train_goal_by_cell[int(cell)]))
             for cell in candidate_cells
         ]
-        subgoals = np.asarray(self.train_dataset["observations"])[subgoal_idxs].astype(
+        return np.asarray(self.train_dataset["observations"])[subgoal_idxs].astype(
             np.float32
         )
+
+    def score_bmm_subgoals(self, observation, goal, subgoals):
         zeros = np.zeros((len(subgoals), self.action_dim), dtype=np.float32)
         source_obs = np.repeat(
             np.asarray(observation, dtype=np.float32)[None, :], len(subgoals), axis=0
@@ -146,7 +179,27 @@ class ValueSubgoalNNPolicy:
             left_scores.append(np.asarray(jax.nn.sigmoid(left_logits)).mean(axis=0))
             right_scores.append(np.asarray(jax.nn.sigmoid(right_logits)).mean(axis=0))
         scores = np.minimum(np.concatenate(left_scores), np.concatenate(right_scores))
-        return scores, subgoals
+        return scores
+
+    def selector_scores(self, observation, goal, candidate_cells, subgoals, source_cell, goal_cell):
+        if self.selector == "random":
+            return self.rng.random(len(candidate_cells)).astype(np.float32)
+        if self.selector == "geometric_midpoint":
+            midpoint = 0.5 * (
+                np.asarray(observation, dtype=np.float32)[:2]
+                + np.asarray(goal, dtype=np.float32)[:2]
+            )
+            return -np.linalg.norm(subgoals[:, :2] - midpoint[None, :], axis=1)
+        if self.selector == "oracle_midpoint":
+            source_d = self.step_distances[int(source_cell), candidate_cells]
+            right_d = self.step_distances[candidate_cells, int(goal_cell)]
+            return -(
+                np.abs(source_d - float(self.left_budget))
+                + np.abs(right_d - float(self.right_budget))
+            )
+        if self.selector == "BMM_V":
+            return self.score_bmm_subgoals(observation, goal, subgoals)
+        raise AssertionError(f"Unhandled selector {self.selector}")
 
     def select_subgoal(self, observation, goal):
         source_cell = self.obs_to_cell(observation)
@@ -156,10 +209,14 @@ class ValueSubgoalNNPolicy:
         cells = self.candidate_cells(source_cell, goal_cell)
         if len(cells) == 0:
             return None
-        scores, subgoals = self.score_subgoals(observation, goal, cells)
+        subgoals = self.subgoals_for_cells(cells)
+        scores = self.selector_scores(
+            observation, goal, cells, subgoals, source_cell, goal_cell
+        )
         selected = int(np.argmax(scores))
         subgoal_cell = int(cells[selected])
         return dict(
+            selector=self.selector,
             subgoal_observation=subgoals[selected],
             subgoal_cell=subgoal_cell,
             subgoal_score=float(scores[selected]),
@@ -303,7 +360,6 @@ def aggregate(rows):
 
 
 def markdown(result):
-    m = result["aggregate"]
     lines = [
         "# BMM value-subgoal policy smoke",
         "",
@@ -312,11 +368,25 @@ def markdown(result):
         f"episodes/task: `{result['episodes_per_task']}`, max steps: `{result['max_steps']}`",
         f"controller hops: `{result['controller_hops']}`",
         "",
-        "| metric | value |",
-        "|---|---:|",
+        "| selector | success | final_d | improve | mean_step_goal | subgoal_valid | subgoal_reduce | goal_reduce | selected_src_d | selected_right_d |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
-    for key, value in m.items():
-        lines.append(f"| {key} | {value:.4f} |")
+    for row in result["selectors"]:
+        m = row["aggregate"]
+        lines.append(
+            "| {name} | {success:.4f} | {final:.4f} | {improve:.4f} | {mean_goal:.4f} | {valid:.4f} | {subgoal_reduce:.4f} | {goal_reduce:.4f} | {src_d:.4f} | {right_d:.4f} |".format(
+                name=row["name"],
+                success=m["success"],
+                final=m["final_goal_distance"],
+                improve=m["goal_distance_improvement"],
+                mean_goal=m["mean_step_goal_improvement"],
+                valid=m["subgoal_valid_frac"],
+                subgoal_reduce=m["subgoal_reduce_frac"],
+                goal_reduce=m["goal_reduce_frac"],
+                src_d=m["selected_source_to_subgoal"],
+                right_d=m["selected_subgoal_to_goal"],
+            )
+        )
     lines.append("")
     return "\n".join(lines)
 
@@ -332,6 +402,11 @@ def main(argv=None):
     parser.add_argument("--right_budget", type=int, default=80)
     parser.add_argument("--controller_hops", type=int, default=0)
     parser.add_argument("--num_subgoal_candidates", type=int, default=64)
+    parser.add_argument(
+        "--selectors",
+        default="BMM_V",
+        help="Comma-separated selectors: random,geometric_midpoint,BMM_V,oracle_midpoint.",
+    )
     parser.add_argument("--task_ids", default="1")
     parser.add_argument("--episodes_per_task", type=int, default=1)
     parser.add_argument("--max_steps", type=int, default=100)
@@ -347,7 +422,6 @@ def main(argv=None):
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
 
     budgets = ar.parse_int_list(args.budgets)
-    rng = np.random.default_rng(args.seed)
     dataset_path = ar.dataset_path_from_dir(args.dataset_dir)
     env, train_dataset, val_dataset = make_env_and_datasets(
         args.env_name, dataset_path=dataset_path
@@ -365,26 +439,35 @@ def main(argv=None):
     value_agent = restore_agent(
         value_agent, args.value_restore_path, args.value_restore_epoch
     )
-    policy = ValueSubgoalNNPolicy(
-        value_agent,
-        train_dataset,
-        context,
-        unwrap_maze_env(env),
-        args.left_budget,
-        args.right_budget,
-        args.controller_hops,
-        args.num_subgoal_candidates,
-        rng,
-        args.score_batch_size,
-    )
     task_ids = parse_int_list(args.task_ids)
-    rows = run_policy_smoke(
-        env,
-        policy,
-        task_ids=task_ids,
-        episodes_per_task=args.episodes_per_task,
-        max_steps=args.max_steps,
-    )
+    selectors = [normalize_selector(name) for name in parse_str_list(args.selectors)]
+    selector_results = []
+    for selector_idx, selector in enumerate(selectors):
+        policy = ValueSubgoalNNPolicy(
+            value_agent,
+            train_dataset,
+            context,
+            unwrap_maze_env(env),
+            args.left_budget,
+            args.right_budget,
+            args.controller_hops,
+            args.num_subgoal_candidates,
+            np.random.default_rng(int(args.seed) + 1009 * selector_idx),
+            args.score_batch_size,
+            selector=selector,
+        )
+        rows = run_policy_smoke(
+            env,
+            policy,
+            task_ids=task_ids,
+            episodes_per_task=args.episodes_per_task,
+            max_steps=args.max_steps,
+        )
+        for row in rows:
+            row["selector"] = selector
+        selector_results.append(
+            dict(name=selector, aggregate=aggregate(rows), episodes=rows)
+        )
     result = dict(
         env_name=args.env_name,
         geodesic_budget_unit=args.geodesic_budget_unit,
@@ -395,10 +478,13 @@ def main(argv=None):
         right_budget=int(args.right_budget),
         controller_hops=int(args.controller_hops),
         num_subgoal_candidates=int(args.num_subgoal_candidates),
+        selector_names=[row["name"] for row in selector_results],
         value_restore_path=args.value_restore_path,
         value_restore_epoch=int(args.value_restore_epoch),
-        aggregate=aggregate(rows),
-        episodes=rows,
+        selectors=selector_results,
+        # Keep the original single-selector JSON keys for existing consumers.
+        aggregate=selector_results[0]["aggregate"] if selector_results else {},
+        episodes=selector_results[0]["episodes"] if selector_results else [],
     )
     text = markdown(result)
     print(text)
