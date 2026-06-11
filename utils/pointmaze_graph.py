@@ -277,6 +277,15 @@ def graph_step_distances(hop_distances, graph):
     return distances
 
 
+def graph_step_distance_matrix(adjacency, graph):
+    """Return all-pairs graph distances in calibrated environment-step units."""
+    rows = [
+        graph_step_distances(shortest_hop_distances(adjacency, source), graph)
+        for source in range(len(adjacency))
+    ]
+    return np.stack(rows, axis=0).astype(np.float32)
+
+
 def sample_graph_budget_pairs(
     dataset,
     state_to_bin,
@@ -287,6 +296,7 @@ def sample_graph_budget_pairs(
     pos_boundary_frac=0.5,
     neg_max_factor=2.0,
     adjacency=None,
+    distance_matrix=None,
 ):
     """Sample balanced graph-distance positive/negative pairs for one budget."""
     budget = int(budget)
@@ -314,6 +324,8 @@ def sample_graph_budget_pairs(
 
     def distances_for_bin(bin_idx):
         bin_idx = int(bin_idx)
+        if distance_matrix is not None:
+            return np.asarray(distance_matrix[bin_idx], dtype=np.float32)
         if bin_idx not in distance_cache:
             hops = shortest_hop_distances(adjacency, bin_idx)
             distance_cache[bin_idx] = graph_step_distances(hops, graph)

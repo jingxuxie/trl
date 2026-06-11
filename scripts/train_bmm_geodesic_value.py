@@ -26,6 +26,7 @@ from utils.pointmaze_graph import (
     build_dataset_position_graph,
     dataset_xy,
     graph_distance_statistics,
+    graph_step_distance_matrix,
     load_graph_npz,
     median_step_xy,
     parse_xy_dims,
@@ -253,10 +254,12 @@ def make_graph_context(train_dataset, val_dataset, xy_dims):
         len(graph["bin_centers"]), graph["edge_src"], graph["edge_dst"]
     )
     stats = graph_distance_statistics(adjacency, graph)
+    distance_matrix = graph_step_distance_matrix(adjacency, graph)
     return dict(
         kind="graph",
         graph=graph,
         adjacency=adjacency,
+        distance_matrix=distance_matrix,
         distance_stats=stats,
     )
 
@@ -301,6 +304,7 @@ def sample_context_budget_pairs(dataset, context, split, budget, num_pairs, rng)
         pos_boundary_frac=FLAGS.pos_boundary_frac,
         neg_max_factor=FLAGS.neg_max_factor,
         adjacency=context["adjacency"],
+        distance_matrix=context["distance_matrix"],
     )
 
 

@@ -62,6 +62,7 @@ def main():
 
     queries = {
         "observations": np.zeros((2, 4, 3), dtype=np.float32),
+        "candidate_observations": np.arange(24, dtype=np.float32).reshape(2, 4, 3),
         "actions": np.zeros((2, 4, 2), dtype=np.float32),
         "next_observations": np.ones((2, 4, 3), dtype=np.float32),
         "goals": np.ones((2, 4, 3), dtype=np.float32),
@@ -71,6 +72,7 @@ def main():
         "source_cells": np.asarray([1, 2], dtype=np.int32),
         "goal_cells": np.asarray([3, 4], dtype=np.int32),
         "candidate_source_idxs": np.arange(8, dtype=np.int32).reshape(2, 4),
+        "candidate_next_cells": np.asarray([[1, 2, 2, 3], [4, 4, 5, 6]], dtype=np.int32),
         "budget": 4,
         "remaining_budget": 3.0,
     }
@@ -83,6 +85,11 @@ def main():
         baselines["source_distance"], labels, distances, source_distances
     )
     assert np.isclose(source_metrics["pairwise_accuracy"], 0.5)
+    diag = ranking.candidate_diagnostics(queries, xy_dims=(0, 1))
+    assert np.isclose(diag["candidate_next_distance_spread_mean"], 4.5)
+    assert np.isclose(diag["oracle_best_distance_mean"], 2.5)
+    assert diag["candidate_source_position_spread_mean"] > 0.0
+    assert np.isclose(diag["candidate_unique_next_cell_count_mean"], 3.0)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         cache_path = Path(tmpdir) / "queries.npz"

@@ -166,6 +166,7 @@ def sample_action_queries(
         raise ValueError("No validation cells have at least two candidate actions.")
 
     observations = []
+    candidate_observations = []
     actions = []
     next_observations = []
     goals = []
@@ -235,6 +236,7 @@ def sample_action_queries(
                 axis=0,
             )
         )
+        candidate_observations.append(np.asarray(dataset["observations"])[candidate_idxs])
         actions.append(np.asarray(dataset["actions"])[candidate_idxs])
         next_observations.append(np.asarray(dataset["observations"])[candidate_idxs + 1])
         goals.append(
@@ -258,6 +260,7 @@ def sample_action_queries(
         )
     return dict(
         observations=np.asarray(observations, dtype=np.float32),
+        candidate_observations=np.asarray(candidate_observations, dtype=np.float32),
         actions=np.asarray(actions, dtype=np.float32),
         next_observations=np.asarray(next_observations, dtype=np.float32),
         goals=np.asarray(goals, dtype=np.float32),
@@ -267,12 +270,16 @@ def sample_action_queries(
         source_cells=np.asarray(source_cells, dtype=np.int32),
         goal_cells=np.asarray(goal_cells, dtype=np.int32),
         candidate_source_idxs=np.asarray(candidate_source_idxs, dtype=np.int32),
+        candidate_next_cells=np.asarray(
+            state_to_cell[np.asarray(candidate_source_idxs, dtype=np.int32) + 1],
+            dtype=np.int32,
+        ),
         budget=int(budget),
         remaining_budget=float(remaining_budget),
     )
 
 
-QUERY_CACHE_KEYS = (
+REQUIRED_QUERY_CACHE_KEYS = (
     "observations",
     "actions",
     "next_observations",
@@ -284,12 +291,20 @@ QUERY_CACHE_KEYS = (
     "goal_cells",
     "candidate_source_idxs",
 )
+OPTIONAL_QUERY_CACHE_KEYS = (
+    "candidate_observations",
+    "candidate_next_cells",
+)
+QUERY_CACHE_KEYS = REQUIRED_QUERY_CACHE_KEYS + OPTIONAL_QUERY_CACHE_KEYS
 
 
 def save_query_cache(path, queries):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {key: np.asarray(queries[key]) for key in QUERY_CACHE_KEYS}
+    payload = {key: np.asarray(queries[key]) for key in REQUIRED_QUERY_CACHE_KEYS}
+    for key in OPTIONAL_QUERY_CACHE_KEYS:
+        if key in queries:
+            payload[key] = np.asarray(queries[key])
     payload["budget"] = np.asarray(int(queries["budget"]), dtype=np.int32)
     payload["remaining_budget"] = np.asarray(
         float(queries["remaining_budget"]), dtype=np.float32
@@ -299,10 +314,63 @@ def save_query_cache(path, queries):
 
 def load_query_cache(path):
     data = np.load(path, allow_pickle=False)
-    queries = {key: np.asarray(data[key]) for key in QUERY_CACHE_KEYS}
+    queries = {key: np.asarray(data[key]) for key in REQUIRED_QUERY_CACHE_KEYS}
+    for key in OPTIONAL_QUERY_CACHE_KEYS:
+        if key in data:
+            queries[key] = np.asarray(data[key])
     queries["budget"] = int(np.asarray(data["budget"]))
     queries["remaining_budget"] = float(np.asarray(data["remaining_budget"]))
     return queries
+
+
+def hydrate_query_candidate_fields(queries, dataset, context, split="val"):
+    candidate_idxs = np.asarray(queries["candidate_source_idxs"], dtype=np.int32)
+    if "candidate_observations" not in queries:
+        queries["candidate_observations"] = np.asarray(dataset["observations"])[
+            candidate_idxs
+        ].astype(np.float32)
+    if "candidate_next_cells" not in queries:
+        state_to_cell = np.asarray(context[f"{split}_state_to_cell"], dtype=np.int32)
+        queries["candidate_next_cells"] = state_to_cell[candidate_idxs + 1].astype(
+            np.int32
+        )
+    return queries
+
+
+def candidate_diagnostics(queries, xy_dims=(0, 1)):
+    distances = np.asarray(queries["distances"], dtype=np.float32)
+    diag = dict(
+        candidate_next_distance_spread_mean=float(
+            (distances.max(axis=1) - distances.min(axis=1)).mean()
+        ),
+        oracle_best_distance_mean=float(distances.min(axis=1).mean()),
+        logged_distance_mean=float(distances[:, 0].mean()),
+        random_distance_mean=float(distances.mean()),
+    )
+    if "candidate_observations" in queries:
+        xy = np.asarray(queries["candidate_observations"], dtype=np.float32)[
+            ..., tuple(xy_dims)
+        ]
+        deltas = xy[:, :, None, :] - xy[:, None, :, :]
+        pairwise = np.linalg.norm(deltas, axis=-1)
+        diag["candidate_source_position_spread_mean"] = float(
+            pairwise.max(axis=(1, 2)).mean()
+        )
+    else:
+        diag["candidate_source_position_spread_mean"] = float("nan")
+    if "candidate_next_cells" in queries:
+        diag["candidate_unique_next_cell_count_mean"] = float(
+            np.asarray(
+                [
+                    len(np.unique(row))
+                    for row in np.asarray(queries["candidate_next_cells"])
+                ],
+                dtype=np.float32,
+            ).mean()
+        )
+    else:
+        diag["candidate_unique_next_cell_count_mean"] = float("nan")
+    return diag
 
 
 def pairwise_ranking_accuracy(scores, distances, eps=1e-6):
@@ -402,9 +470,18 @@ def score_flat(agent, observations, actions, goals, budgets, batch_size):
     return np.concatenate(mean_scores), np.concatenate(min_scores)
 
 
-def score_queries(agent, queries, budget, interp_budgets, batch_size):
+def score_queries(
+    agent,
+    queries,
+    budget,
+    interp_budgets,
+    batch_size,
+    observation_key="observations",
+):
     shape = queries["labels"].shape
-    observations = queries["observations"].reshape((-1, queries["observations"].shape[-1]))
+    observations = queries[observation_key].reshape(
+        (-1, queries[observation_key].shape[-1])
+    )
     actions = queries["actions"].reshape((-1, queries["actions"].shape[-1]))
     goals = queries["goals"].reshape((-1, queries["goals"].shape[-1]))
     budgets = np.full(len(observations), int(budget), dtype=np.int32)
@@ -567,6 +644,17 @@ def summarize_markdown(result):
     lines.extend(
         [
             "",
+            "Candidate diagnostics:",
+            "",
+            "| metric | value |",
+            "|---|---:|",
+        ]
+    )
+    for key, value in result.get("candidate_diagnostics", {}).items():
+        lines.append(f"| {key} | {format_metric(value)} |")
+    lines.extend(
+        [
+            "",
             "Baselines:",
             "",
             "| score | pair_acc | AUC | gap | selected_d | logged_d | random_d | selected_improve | selected_success |",
@@ -683,6 +771,7 @@ def main(argv=None):
             args.candidate_count,
             rng,
         )
+    hydrate_query_candidate_fields(queries, val_dataset, context, split="val")
     if args.save_query_cache:
         if args.query_cache_path is None:
             raise ValueError("--save_query_cache requires --query_cache_path.")
@@ -739,6 +828,9 @@ def main(argv=None):
         value_restore_path=args.value_restore_path,
         value_restore_epoch=args.value_restore_epoch,
         budget_scan=budget_scan_info,
+        candidate_diagnostics=candidate_diagnostics(
+            queries, xy_dims=parse_xy_dims(args.xy_dims)
+        ),
         context=dict(
             maze_type=context["maze_type"],
             maze_unit=context["maze_unit"],
@@ -768,6 +860,22 @@ def main(argv=None):
             args.budget,
             interp_budgets,
             args.score_batch_size,
+            observation_key="observations",
+        )
+        repeated_scores = {
+            f"q_repeated_source_{key}": value for key, value in scores.items()
+        }
+        own_scores = score_queries(
+            agent,
+            queries,
+            args.budget,
+            interp_budgets,
+            args.score_batch_size,
+            observation_key="candidate_observations",
+        )
+        scores.update(repeated_scores)
+        scores.update(
+            {f"q_candidate_own_state_{key}": value for key, value in own_scores.items()}
         )
         for mode, budget_by_query in budget_scan_by_mode.items():
             mean_scores, min_scores = score_queries_with_budget_array(

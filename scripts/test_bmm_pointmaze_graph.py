@@ -15,10 +15,12 @@ from utils.datasets import Dataset
 from utils.pointmaze_graph import (
     adjacency_lists,
     build_dataset_position_graph,
+    graph_step_distance_matrix,
     graph_step_distances,
     sample_graph_budget_pairs,
     shortest_hop_distances,
 )
+from scripts import train_bmm_geodesic_q as qdiag
 
 
 def make_line_dataset(length=9):
@@ -61,8 +63,10 @@ def main():
     )
     hops = shortest_hop_distances(adjacency, graph["train_state_to_bin"][0])
     distances = graph_step_distances(hops, graph)
+    distance_matrix = graph_step_distance_matrix(adjacency, graph)
     assert distances[graph["train_state_to_bin"][0]] == 0
     assert distances[graph["train_state_to_bin"][4]] == 4
+    np.testing.assert_allclose(distance_matrix[graph["train_state_to_bin"][0]], distances)
 
     pair_batch = sample_graph_budget_pairs(
         train_dataset,
@@ -72,6 +76,7 @@ def main():
         num_pairs=64,
         rng=rng,
         adjacency=adjacency,
+        distance_matrix=distance_matrix,
     )
     assert pair_batch is not None
     assert pair_batch["labels"].sum() > 0
@@ -79,6 +84,37 @@ def main():
     assert np.all(pair_batch["graph_distances"][pair_batch["labels"] == 1] <= 3)
     assert np.all(pair_batch["graph_distances"][pair_batch["labels"] == 0] > 3)
     assert binary_auc(-pair_batch["graph_distances"], pair_batch["labels"]) == 1.0
+
+    if not qdiag.FLAGS.is_parsed():
+        qdiag.FLAGS(["test_bmm_pointmaze_graph"])
+    qdiag.FLAGS.num_trans_witnesses = 2
+    qdiag.FLAGS.trans_witness_mode = "slack_balanced"
+    qdiag.FLAGS.trans_pos_boundary_frac = 0.5
+    qdiag.FLAGS.trans_endpoint_epsilon = 1e-6
+    qdiag.FLAGS.trans_boundary_beta = 0.25
+    qv_batch = qdiag.sample_graph_qv_transitive_pairs(
+        train_dataset,
+        dict(
+            kind="graph",
+            graph=graph,
+            adjacency=adjacency,
+            distance_matrix=distance_matrix,
+        ),
+        "train",
+        budgets=(4,),
+        batch_size=8,
+        rng=rng,
+    )
+    assert qv_batch["qv_observations"].shape == (8, 2)
+    assert qv_batch["qv_midpoint_observations"].shape == (2, 8, 2)
+    assert qv_batch["qv_valids"].shape == (2, 8)
+    assert np.all(qv_batch["qv_valids"] == 1.0)
+    assert np.all(qv_batch["qv_parent_distances"] <= 3.0)
+    assert np.all(qv_batch["qv_left_distances"] <= 1.0)
+    assert np.all(qv_batch["qv_right_distances"] <= 2.0)
+    assert np.all(qv_batch["qv_parent_oracle_labels"] == 1.0)
+    assert np.all(qv_batch["qv_left_oracle_labels"] == 1.0)
+    assert np.all(qv_batch["qv_right_oracle_labels"] == 1.0)
 
     print("PointMaze graph utility checks passed.")
 

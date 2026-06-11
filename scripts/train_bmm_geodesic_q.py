@@ -29,6 +29,7 @@ from utils.pointmaze_graph import (
     bin_to_state_indices,
     build_dataset_position_graph,
     dataset_xy,
+    graph_step_distance_matrix,
     graph_step_distances,
     graph_distance_statistics,
     load_graph_npz,
@@ -331,10 +332,12 @@ def make_graph_context(train_dataset, val_dataset, xy_dims):
         len(graph["bin_centers"]), graph["edge_src"], graph["edge_dst"]
     )
     stats = graph_distance_statistics(adjacency, graph)
+    distance_matrix = graph_step_distance_matrix(adjacency, graph)
     return dict(
         kind="graph",
         graph=graph,
         adjacency=adjacency,
+        distance_matrix=distance_matrix,
         distance_stats=stats,
     )
 
@@ -360,6 +363,7 @@ def sample_graph_budget_q_pairs(
     pos_boundary_frac=0.5,
     neg_max_factor=2.0,
     adjacency=None,
+    distance_matrix=None,
 ):
     """Sample balanced graph-distance Q pairs labeled from the next state."""
     budget = int(budget)
@@ -397,6 +401,8 @@ def sample_graph_budget_q_pairs(
 
     def distances_for_bin(bin_idx):
         bin_idx = int(bin_idx)
+        if distance_matrix is not None:
+            return np.asarray(distance_matrix[bin_idx], dtype=np.float32)
         if bin_idx not in distance_cache:
             hops = shortest_hop_distances(adjacency, bin_idx)
             distance_cache[bin_idx] = graph_step_distances(hops, graph)
@@ -497,6 +503,7 @@ def sample_context_budget_pairs(dataset, context, split, budget, num_pairs, rng)
         pos_boundary_frac=FLAGS.pos_boundary_frac,
         neg_max_factor=FLAGS.neg_max_factor,
         adjacency=context["adjacency"],
+        distance_matrix=context["distance_matrix"],
     )
 
 
@@ -914,6 +921,250 @@ def sample_grid_qv_transitive_pairs(dataset, context, split, budgets, batch_size
             float(attempts) / float(max(len(observations), 1)), dtype=np.float32
         ),
     )
+
+
+def sample_graph_qv_transitive_pairs(dataset, context, split, budgets, batch_size, rng):
+    """Sample graph-valid Q/V tuples for y=max_w min(Q_h(s,a,w), V_{H-h}(w,g))."""
+    if context["kind"] != "graph":
+        raise ValueError("Graph Q/V transitive sampling requires graph labels.")
+
+    graph = context["graph"]
+    adjacency = context["adjacency"]
+    state_to_bin = np.asarray(graph[f"{split}_state_to_bin"], dtype=np.int32)
+    state_by_bin = bin_to_state_indices(state_to_bin, len(graph["bin_centers"]))
+    has_state = np.asarray([len(items) > 0 for items in state_by_bin])
+    src_idxs = valid_transition_indices(dataset)
+    src_idxs = src_idxs[src_idxs + 1 < len(state_to_bin)]
+    src_idxs = src_idxs[
+        (state_to_bin[src_idxs] >= 0) & (state_to_bin[src_idxs + 1] >= 0)
+    ]
+    budgets = tuple(int(x) for x in budgets)
+    num_witnesses = int(FLAGS.num_trans_witnesses)
+    if num_witnesses < 1:
+        raise ValueError("--num_trans_witnesses must be >= 1.")
+
+    distance_cache = {}
+
+    def distances_for_bin(bin_idx):
+        bin_idx = int(bin_idx)
+        if "distance_matrix" in context:
+            return np.asarray(context["distance_matrix"][bin_idx], dtype=np.float32)
+        if bin_idx not in distance_cache:
+            hops = shortest_hop_distances(adjacency, bin_idx)
+            distance_cache[bin_idx] = graph_step_distances(hops, graph)
+        return distance_cache[bin_idx]
+
+    observations = []
+    actions = []
+    goals = []
+    value_budgets = []
+    value_offsets = []
+    witness_observations = []
+    witness_actions = []
+    witness_goals = []
+    witness_offsets = []
+    left_budgets = []
+    right_budgets = []
+    trans_valids = []
+    parent_distances = []
+    left_distances = []
+    right_distances = []
+    left_slacks = []
+    right_slacks = []
+    witness_cell_counts = []
+    witness_candidate_counts = []
+    effective_unique_witness_counts = []
+    unique_witness_fracs = []
+    replacement_used = []
+    witness_fallback_used = []
+    qv_parent_oracle_labels = []
+    qv_left_oracle_labels = []
+    qv_right_oracle_labels = []
+
+    attempts = 0
+    max_attempts = max(1000, int(batch_size) * 300)
+    while len(observations) < int(batch_size) and attempts < max_attempts:
+        attempts += 1
+        budget = int(rng.choice(budgets))
+        if budget <= 2:
+            continue
+        left_budget = max(1, budget // 2)
+        right_budget = max(1, budget - left_budget)
+        left_remaining = max(float(left_budget) - 1.0, 1.0)
+
+        src_idx = int(rng.choice(src_idxs))
+        next_bin = int(state_to_bin[src_idx + 1])
+        next_distances = distances_for_bin(next_bin)
+        finite_goal = np.isfinite(next_distances) & has_state
+        goal_hi = max(float(budget) - 1.0, 1.0)
+        goal_lo = max(0.0, float(FLAGS.trans_pos_boundary_frac) * goal_hi)
+        goal_mask = finite_goal & (next_distances >= goal_lo) & (next_distances <= goal_hi)
+        if not goal_mask.any() and goal_lo > 0.0:
+            goal_mask = finite_goal & (next_distances <= goal_hi)
+        goal_bins = np.nonzero(goal_mask)[0]
+        if len(goal_bins) == 0:
+            continue
+
+        goal_bin = int(rng.choice(goal_bins))
+        right_to_goal = distances_for_bin(goal_bin)
+        witness_mask = (
+            has_state
+            & np.isfinite(next_distances)
+            & np.isfinite(right_to_goal)
+            & (next_distances <= left_remaining)
+            & (right_to_goal <= float(right_budget))
+        )
+        selection = select_witness_cells(
+            witness_mask,
+            next_distances,
+            right_to_goal,
+            left_remaining,
+            right_budget,
+            num_witnesses,
+            rng,
+        )
+        if selection is None:
+            continue
+
+        sampled_witness_bins = selection["sampled_witness_cells"]
+        goal_idx = int(rng.choice(state_by_bin[goal_bin]))
+        parent_distance = float(next_distances[goal_bin])
+        observations.append(np.asarray(dataset["observations"])[src_idx])
+        actions.append(np.asarray(dataset["actions"])[src_idx])
+        goals.append(np.asarray(dataset["observations"])[goal_idx])
+        value_budgets.append(budget)
+        value_offsets.append(parent_distance)
+        parent_distances.append(parent_distance)
+        qv_parent_oracle_labels.append(float(parent_distance <= goal_hi))
+        witness_cell_counts.append(float(len(selection["witness_cells"])))
+        witness_candidate_counts.append(float(len(selection["candidate_cells"])))
+        effective_unique_witness_counts.append(
+            selection["effective_unique_witness_count"]
+        )
+        unique_witness_fracs.append(selection["unique_witness_frac"])
+        replacement_used.append(selection["replacement_used"])
+        witness_fallback_used.append(selection["fallback_used"])
+
+        parent_witness_observations = []
+        parent_witness_actions = []
+        parent_witness_goals = []
+        parent_witness_offsets = []
+        parent_left_budgets = []
+        parent_right_budgets = []
+        parent_valids = []
+        parent_left_distances = []
+        parent_right_distances = []
+        parent_left_slacks = []
+        parent_right_slacks = []
+        parent_left_oracle_labels = []
+        parent_right_oracle_labels = []
+        for witness_bin in sampled_witness_bins:
+            witness_bin = int(witness_bin)
+            witness_idx = int(rng.choice(state_by_bin[witness_bin]))
+            left_distance = float(next_distances[witness_bin])
+            right_distance = float(right_to_goal[witness_bin])
+            parent_witness_observations.append(
+                np.asarray(dataset["observations"])[witness_idx]
+            )
+            parent_witness_actions.append(np.asarray(dataset["actions"])[witness_idx])
+            parent_witness_goals.append(np.asarray(dataset["observations"])[witness_idx])
+            parent_witness_offsets.append(left_distance)
+            parent_left_budgets.append(left_budget)
+            parent_right_budgets.append(right_budget)
+            parent_valids.append(1.0)
+            parent_left_distances.append(left_distance)
+            parent_right_distances.append(right_distance)
+            parent_left_slacks.append(left_remaining - left_distance)
+            parent_right_slacks.append(float(right_budget) - right_distance)
+            parent_left_oracle_labels.append(float(left_distance <= left_remaining))
+            parent_right_oracle_labels.append(float(right_distance <= float(right_budget)))
+
+        witness_observations.append(parent_witness_observations)
+        witness_actions.append(parent_witness_actions)
+        witness_goals.append(parent_witness_goals)
+        witness_offsets.append(parent_witness_offsets)
+        left_budgets.append(parent_left_budgets)
+        right_budgets.append(parent_right_budgets)
+        trans_valids.append(parent_valids)
+        left_distances.append(parent_left_distances)
+        right_distances.append(parent_right_distances)
+        left_slacks.append(parent_left_slacks)
+        right_slacks.append(parent_right_slacks)
+        qv_left_oracle_labels.append(parent_left_oracle_labels)
+        qv_right_oracle_labels.append(parent_right_oracle_labels)
+
+    if len(observations) < int(batch_size):
+        raise ValueError(
+            f"Could not sample {batch_size} graph Q/V transitive tuples for "
+            f"split={split}; got {len(observations)} after {attempts} attempts."
+        )
+
+    return dict(
+        qv_observations=np.asarray(observations, dtype=np.float32),
+        qv_actions=np.asarray(actions, dtype=np.float32),
+        qv_goals=np.asarray(goals, dtype=np.float32),
+        qv_budgets=np.asarray(value_budgets, dtype=np.int32),
+        qv_offsets=np.rint(value_offsets).astype(np.int32),
+        qv_midpoint_observations=np.swapaxes(
+            np.asarray(witness_observations, dtype=np.float32), 0, 1
+        ),
+        qv_midpoint_actions=np.swapaxes(
+            np.asarray(witness_actions, dtype=np.float32), 0, 1
+        ),
+        qv_midpoint_goals=np.swapaxes(
+            np.asarray(witness_goals, dtype=np.float32), 0, 1
+        ),
+        qv_midpoint_offsets=np.rint(
+            np.swapaxes(np.asarray(witness_offsets, dtype=np.float32), 0, 1)
+        ).astype(np.int32),
+        qv_left_budgets=np.swapaxes(np.asarray(left_budgets, dtype=np.int32), 0, 1),
+        qv_right_budgets=np.swapaxes(np.asarray(right_budgets, dtype=np.int32), 0, 1),
+        qv_valids=np.swapaxes(np.asarray(trans_valids, dtype=np.float32), 0, 1),
+        qv_parent_distances=np.asarray(parent_distances, dtype=np.float32),
+        qv_left_distances=np.swapaxes(
+            np.asarray(left_distances, dtype=np.float32), 0, 1
+        ),
+        qv_right_distances=np.swapaxes(
+            np.asarray(right_distances, dtype=np.float32), 0, 1
+        ),
+        qv_left_slacks=np.swapaxes(np.asarray(left_slacks, dtype=np.float32), 0, 1),
+        qv_right_slacks=np.swapaxes(np.asarray(right_slacks, dtype=np.float32), 0, 1),
+        qv_witness_cell_counts=np.asarray(witness_cell_counts, dtype=np.float32),
+        qv_witness_candidate_counts=np.asarray(
+            witness_candidate_counts, dtype=np.float32
+        ),
+        qv_effective_unique_witness_counts=np.asarray(
+            effective_unique_witness_counts, dtype=np.float32
+        ),
+        qv_unique_witness_fracs=np.asarray(unique_witness_fracs, dtype=np.float32),
+        qv_replacement_used=np.asarray(replacement_used, dtype=np.float32),
+        qv_witness_fallback_used=np.asarray(witness_fallback_used, dtype=np.float32),
+        qv_parent_oracle_labels=np.asarray(qv_parent_oracle_labels, dtype=np.float32),
+        qv_left_oracle_labels=np.swapaxes(
+            np.asarray(qv_left_oracle_labels, dtype=np.float32), 0, 1
+        ),
+        qv_right_oracle_labels=np.swapaxes(
+            np.asarray(qv_right_oracle_labels, dtype=np.float32), 0, 1
+        ),
+        qv_sample_acceptance_rate=np.asarray(
+            float(len(observations)) / float(max(attempts, 1)), dtype=np.float32
+        ),
+        qv_attempts_per_sample=np.asarray(
+            float(attempts) / float(max(len(observations), 1)), dtype=np.float32
+        ),
+    )
+
+
+def sample_context_qv_transitive_pairs(dataset, context, split, budgets, batch_size, rng):
+    if context["kind"] == "grid_geodesic":
+        return sample_grid_qv_transitive_pairs(
+            dataset, context, split, budgets, batch_size, rng
+        )
+    if context["kind"] == "graph":
+        return sample_graph_qv_transitive_pairs(
+            dataset, context, split, budgets, batch_size, rng
+        )
+    raise ValueError(f"Unsupported Q/V transitive context kind: {context['kind']}")
 
 
 def qv_transitive_loss(
@@ -1683,7 +1934,7 @@ def main(_):
         train_batch = gc_train.sample(base_batch_size)
         qv_fields = None
         if FLAGS.lambda_qv_trans > 0.0:
-            qv_fields = sample_grid_qv_transitive_pairs(
+            qv_fields = sample_context_qv_transitive_pairs(
                 train_dataset,
                 context,
                 "train",

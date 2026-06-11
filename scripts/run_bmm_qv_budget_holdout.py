@@ -148,7 +148,8 @@ def train_command(args, spec, output_json, save_dir=None):
         args.python,
         str(TRAIN_SCRIPT),
         f"--env_name={args.env_name}",
-        "--reachability_label_type=grid_geodesic",
+        f"--reachability_label_type={args.reachability_label_type}",
+        f"--graph_path={args.graph_path}",
         f"--geodesic_budget_unit={args.geodesic_budget_unit}",
         f"--budgets={tuple_flag(parse_int_list(args.budgets))}",
         f"--eval_budgets={tuple_flag(parse_int_list(args.eval_budgets))}",
@@ -192,6 +193,8 @@ def train_command(args, spec, output_json, save_dir=None):
         )
     if args.fail_on_threshold:
         cmd.append("--fail_on_threshold")
+    if args.rebuild_graph:
+        cmd.append("--rebuild_graph")
     return cmd
 
 
@@ -326,6 +329,13 @@ def parse_args(argv):
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--run_dir", default=None)
     parser.add_argument("--env_name", default="pointmaze-medium-navigate-v0")
+    parser.add_argument(
+        "--reachability_label_type",
+        default="grid_geodesic",
+        choices=("grid_geodesic", "graph"),
+    )
+    parser.add_argument("--graph_path", default="exp/bmm_pointmaze_graph.npz")
+    parser.add_argument("--rebuild_graph", action="store_true")
     parser.add_argument("--geodesic_budget_unit", default="grid_cells")
     parser.add_argument("--budgets", default="2,4,8")
     parser.add_argument("--eval_budgets", default="2,4,8")
