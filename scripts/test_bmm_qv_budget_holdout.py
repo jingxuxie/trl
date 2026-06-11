@@ -38,6 +38,9 @@ def main():
     assert "--supervised_budgets=(2, 4)" in cmd
     assert "--eval_budgets=(2, 4, 8)" in cmd
     assert "--trans_budgets=(8)" in cmd
+    saved_cmd = holdout.train_command(args, spec, Path("out.json"), save_dir=Path("ckpt"))
+    assert "--save_dir=ckpt" in saved_cmd
+    assert "--save_epoch=1000" in saved_cmd
 
     report = {
         "eval": {

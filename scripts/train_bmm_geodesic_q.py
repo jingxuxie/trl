@@ -23,7 +23,7 @@ from agents.bmm_trl import masked_mean
 from envs.env_utils import make_env_and_datasets
 from scripts.bmm_reachability_utils import binary_metrics, format_metric, rank_metrics
 from utils.datasets import Dataset, GCDataset
-from utils.flax_utils import restore_agent
+from utils.flax_utils import restore_agent, save_agent
 from utils.pointmaze_graph import (
     adjacency_lists,
     bin_to_state_indices,
@@ -202,6 +202,16 @@ flags.DEFINE_bool(
     "Exit nonzero if final heldout metrics do not pass thresholds.",
 )
 flags.DEFINE_string("output_json", None, "Optional path to write final metrics.")
+flags.DEFINE_string(
+    "save_dir",
+    None,
+    "Optional directory to save the final Q critic agent checkpoint.",
+)
+flags.DEFINE_integer(
+    "save_epoch",
+    None,
+    "Checkpoint epoch name for --save_dir; defaults to --steps.",
+)
 
 config_flags.DEFINE_config_file("agent", "agents/bmm_trl.py", lock_config=False)
 
@@ -1773,9 +1783,16 @@ def main(_):
             trans_boundary_beta=float(FLAGS.trans_boundary_beta),
             value_restore_path=FLAGS.value_restore_path,
             value_restore_epoch=FLAGS.value_restore_epoch,
+            save_dir=FLAGS.save_dir,
+            save_epoch=int(FLAGS.save_epoch or FLAGS.steps),
             context=context_metadata(context),
         ),
     )
+    if FLAGS.save_dir is not None:
+        save_dir = Path(FLAGS.save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        save_agent(agent, str(save_dir), int(FLAGS.save_epoch or FLAGS.steps))
+
     if FLAGS.output_json is not None:
         output_path = Path(FLAGS.output_json)
         output_path.parent.mkdir(parents=True, exist_ok=True)

@@ -143,7 +143,7 @@ def run_id(spec):
     )
 
 
-def train_command(args, spec, output_json):
+def train_command(args, spec, output_json, save_dir=None):
     cmd = [
         args.python,
         str(TRAIN_SCRIPT),
@@ -176,6 +176,13 @@ def train_command(args, spec, output_json):
         f"--agent.layer_norm={args.layer_norm}",
         f"--output_json={output_json}",
     ]
+    if save_dir is not None:
+        cmd.extend(
+            [
+                f"--save_dir={save_dir}",
+                f"--save_epoch={args.steps}",
+            ]
+        )
     if args.value_restore_path:
         cmd.extend(
             [
@@ -359,6 +366,11 @@ def parse_args(argv):
     parser.add_argument("--layer_norm", default="False")
     parser.add_argument("--fail_on_threshold", action="store_true")
     parser.add_argument("--skip_existing", action="store_true")
+    parser.add_argument(
+        "--save_agents",
+        action="store_true",
+        help="Save a final checkpoint for each run under run_dir/<run_id>/.",
+    )
     parser.add_argument("--dry_run", action="store_true")
     return parser.parse_args(argv)
 
@@ -373,7 +385,8 @@ def main(argv=None):
     for spec in specs:
         rid = run_id(spec)
         output_json = run_dir / f"{rid}.json"
-        cmd = train_command(args, spec, output_json)
+        save_dir = run_dir / rid if args.save_agents else None
+        cmd = train_command(args, spec, output_json, save_dir=save_dir)
         print("\n==", rid, "==")
         print(" ".join(cmd))
         if args.dry_run:
