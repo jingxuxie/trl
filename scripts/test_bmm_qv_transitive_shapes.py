@@ -105,6 +105,26 @@ def main():
             rng=rng,
         )
     )
+    sparse_sup = qdiag.make_sup_fields(
+        raw_dataset,
+        context,
+        "train",
+        budgets=(2, 4),
+        pairs_per_budget=action_config.batch_size,
+        rng=rng,
+        valid_counts={2: action_config.batch_size, 4: 2},
+    )
+    assert sparse_sup["value_sup_observations"].shape[:2] == (
+        2,
+        action_config.batch_size,
+    )
+    h4_mask = sparse_sup["value_sup_budgets"] == 4
+    h4_valids = sparse_sup["value_sup_valids"][h4_mask]
+    h4_labels = sparse_sup["value_sup_labels"][h4_mask]
+    assert int(h4_valids.sum()) == 2
+    assert int((h4_labels[h4_valids > 0] == 1.0).sum()) == 1
+    assert int((h4_labels[h4_valids > 0] == 0.0).sum()) == 1
+
     qv_fields = qdiag.sample_grid_qv_transitive_pairs(
         raw_dataset,
         context,
@@ -119,8 +139,20 @@ def main():
     assert np.all(batch["qv_left_distances"][batch["qv_valids"] > 0] <= 1.0)
     assert np.all(batch["qv_right_distances"][batch["qv_valids"] > 0] <= 2.0)
     assert np.all(batch["qv_effective_unique_witness_counts"] >= 1.0)
+    assert "qv_parent_oracle_labels" in batch
+    assert "qv_left_oracle_labels" in batch
+    assert "qv_right_oracle_labels" in batch
+    assert batch["qv_left_oracle_labels"].shape == batch["qv_valids"].shape
+    assert np.all(batch["qv_left_oracle_labels"][batch["qv_valids"] > 0] == 1.0)
+    assert np.all(batch["qv_right_oracle_labels"][batch["qv_valids"] > 0] == 1.0)
 
+    branch_modes = (
+        "learned_q_frozen_v",
+        "oracle_q_frozen_v",
+        "oracle_q_oracle_v",
+    )
     for loss_type in ("bce_equal", "prob_hinge", "bce_lower_bound"):
+        branch_mode = branch_modes[0]
         agent, info = qdiag.update_with_qv_trans(
             agent,
             batch,
@@ -128,7 +160,9 @@ def main():
             1.0,
             qv_trans_loss_type=loss_type,
             qv_trans_bce_margin=0.0,
+            qv_branch_mode=branch_mode,
             trans_budgets=(4,),
+            budgets=(1, 2, 4),
         )
         for key in (
             "critic/loss_sup",
@@ -141,20 +175,81 @@ def main():
             "critic/qv_frac_y_trans_lt_parent",
             "critic/qv_first_q_mean",
             "critic/qv_second_v_mean",
+            "critic/qv_parent_oracle_label_mean",
+            "critic/qv_left_oracle_label_mean",
+            "critic/qv_right_oracle_label_mean",
             "critic/loss_qv_trans_by_budget/H4",
             "critic/qv_y_trans_mean_by_budget/H4",
             "critic/qv_parent_r_mean_by_budget/H4",
             "critic/qv_first_q_mean_by_budget/H4",
             "critic/qv_second_v_mean_by_budget/H4",
+            "critic/qv_target_minus_parent_mean_by_budget/H4",
+            "critic/qv_frac_y_trans_gt_parent_by_budget/H4",
+            "critic/qv_frac_y_trans_lt_parent_by_budget/H4",
             "critic/total_loss_with_qv",
+            "critic/total_loss_with_aux",
         ):
             assert key in info, f"Missing {loss_type} Q/V metric {key}"
             assert bool(jnp.all(jnp.isfinite(info[key]))), (key, info[key])
+
+    for branch_mode in branch_modes[1:]:
+        agent, info = qdiag.update_with_qv_trans(
+            agent,
+            batch,
+            value_agent if branch_mode != "oracle_q_oracle_v" else None,
+            1.0,
+            qv_trans_loss_type="bce_lower_bound",
+            qv_trans_bce_margin=0.0,
+            qv_branch_mode=branch_mode,
+            trans_budgets=(4,),
+            budgets=(1, 2, 4),
+        )
+        assert "critic/loss_qv_trans" in info
+        assert bool(jnp.all(jnp.isfinite(info["critic/loss_qv_trans"])))
+
+    vnext_batch = gc_dataset.sample(action_config.batch_size)
+    vnext_batch.update(
+        qdiag.make_sup_fields(
+            raw_dataset,
+            context,
+            "train",
+            budgets=(4,),
+            pairs_per_budget=action_config.batch_size,
+            rng=rng,
+        )
+    )
+    agent, info = qdiag.update_with_qv_trans(
+        agent,
+        vnext_batch,
+        value_agent,
+        0.0,
+        lambda_vnext_distill=1.0,
+        vnext_distill_loss_type="bce_lower_bound",
+        vnext_distill_bce_margin=0.0,
+        trans_budgets=(4,),
+        budgets=(1, 2, 4),
+        use_qv_trans=False,
+        use_vnext_distill=True,
+    )
+    for key in (
+        "critic/loss_vnext_distill",
+        "critic/vnext_valid_frac",
+        "critic/vnext_target_r_mean",
+        "critic/vnext_parent_r_mean",
+        "critic/vnext_target_minus_parent_mean",
+        "critic/loss_vnext_distill_by_budget/H4",
+        "critic/vnext_target_r_mean_by_budget/H4",
+        "critic/total_loss_with_aux",
+    ):
+        assert key in info, f"Missing V-next metric {key}"
+        assert bool(jnp.all(jnp.isfinite(info[key]))), (key, info[key])
 
     summary = qdiag.summarize_qv_transitive_batch(qv_fields, budgets=(4,))
     assert summary["budget_rows"][0]["effective_unique_witness_count_mean"] >= 1.0
     assert summary["budget_rows"][0]["zero_left_frac"] == 0.0
     assert summary["budget_rows"][0]["zero_right_frac"] == 0.0
+    assert summary["budget_rows"][0]["left_oracle_label_mean"] == 1.0
+    assert summary["budget_rows"][0]["right_oracle_label_mean"] == 1.0
 
     del agent
     print("BMM Q/V transitive shape checks passed.")

@@ -69,6 +69,16 @@ flags.DEFINE_enum(
 flags.DEFINE_integer("seed", 0, "Random seed.")
 flags.DEFINE_string("budgets", "(32, 64, 96, 128)", "Budgets to train/evaluate.")
 flags.DEFINE_string(
+    "eval_budgets",
+    None,
+    "Optional budgets to evaluate; defaults to --budgets.",
+)
+flags.DEFINE_string(
+    "supervised_budgets",
+    None,
+    "Optional budgets with full direct Q labels; defaults to --budgets.",
+)
+flags.DEFINE_string(
     "trans_budgets",
     None,
     "Optional budgets for Q/V transitive parents; defaults to --budgets.",
@@ -78,6 +88,17 @@ flags.DEFINE_integer(
     "sup_pairs_per_budget",
     0,
     "Direct supervised Q pairs per budget per update; <=0 uses --batch_size.",
+)
+flags.DEFINE_float(
+    "parent_label_budget_frac",
+    0.0,
+    "Fraction of direct labels to keep for budgets not in --supervised_budgets.",
+)
+flags.DEFINE_integer(
+    "parent_label_pairs_per_budget",
+    -1,
+    "Direct labels per update for budgets not in --supervised_budgets; "
+    ">=0 overrides --parent_label_budget_frac.",
 )
 flags.DEFINE_integer(
     "trans_pairs_per_update",
@@ -116,6 +137,28 @@ flags.DEFINE_float(
     "qv_trans_bce_margin",
     0.0,
     "Probability margin for gated BCE lower-bound Q/V transitive loss.",
+)
+flags.DEFINE_float(
+    "lambda_vnext_distill",
+    0.0,
+    "Direct Q_H(s,a,g) to frozen V_{H-1}(s_next,g) distillation weight.",
+)
+flags.DEFINE_enum(
+    "vnext_distill_loss_type",
+    "bce_equal",
+    ["bce_equal", "prob_hinge", "bce_lower_bound"],
+    "V-next distillation loss: equality BCE or lower-bound variants.",
+)
+flags.DEFINE_float(
+    "vnext_distill_bce_margin",
+    0.0,
+    "Probability margin for gated BCE lower-bound V-next distillation.",
+)
+flags.DEFINE_enum(
+    "qv_branch_mode",
+    "learned_q_frozen_v",
+    ["learned_q_frozen_v", "oracle_q_frozen_v", "oracle_q_oracle_v"],
+    "Q/V transitive branch target mode for diagnostics.",
 )
 flags.DEFINE_float(
     "trans_pos_boundary_frac",
@@ -453,9 +496,51 @@ def pair_distance(row):
     return row["graph_distances"]
 
 
-def make_sup_fields(dataset, context, split, budgets, pairs_per_budget, rng):
+def masked_valids_for_row(labels, valid_count, pairs_per_budget):
+    """Return a balanced valid mask for a pre-sampled supervised row."""
+    labels = np.asarray(labels, dtype=np.float32)
+    valid_count = min(int(valid_count), int(pairs_per_budget), len(labels))
+    if valid_count <= 0:
+        return np.zeros(int(pairs_per_budget), dtype=np.float32)
+    num_pos = valid_count // 2
+    num_neg = valid_count - num_pos
+    if num_pos == 0 or num_neg == 0:
+        raise ValueError(
+            "Sparse direct labels require at least one positive and one negative "
+            f"example; got valid_count={valid_count}."
+        )
+    pos_idxs = np.nonzero(labels == 1.0)[0]
+    neg_idxs = np.nonzero(labels == 0.0)[0]
+    if len(pos_idxs) < num_pos or len(neg_idxs) < num_neg:
+        raise ValueError(
+            f"Could not build balanced mask with {num_pos} positives and "
+            f"{num_neg} negatives from row counts pos={len(pos_idxs)} neg={len(neg_idxs)}."
+        )
+    valids = np.zeros(int(pairs_per_budget), dtype=np.float32)
+    valids[pos_idxs[:num_pos]] = 1.0
+    valids[neg_idxs[:num_neg]] = 1.0
+    return valids
+
+
+def make_sup_fields(
+    dataset,
+    context,
+    split,
+    budgets,
+    pairs_per_budget,
+    rng,
+    valid_counts=None,
+):
     rows = []
+    valid_rows = []
     for budget in budgets:
+        valid_count = (
+            int(pairs_per_budget)
+            if valid_counts is None
+            else int(valid_counts.get(int(budget), 0))
+        )
+        if valid_count <= 0:
+            continue
         row = sample_context_budget_pairs(
             dataset,
             context,
@@ -476,6 +561,10 @@ def make_sup_fields(dataset, context, split, budgets, pairs_per_budget, rng):
                 f"with both classes for split={split}, H={budget}; got {got}."
             )
         rows.append(row)
+        valid_rows.append(masked_valids_for_row(row["labels"], valid_count, pairs_per_budget))
+
+    if not rows:
+        raise ValueError(f"No supervised {context['kind']} rows requested for split={split}.")
 
     distances = [pair_distance(row) for row in rows]
     return dict(
@@ -494,9 +583,24 @@ def make_sup_fields(dataset, context, split, budgets, pairs_per_budget, rng):
             axis=0,
         ),
         value_sup_labels=np.stack([row["labels"] for row in rows], axis=0),
-        value_sup_valids=np.ones((len(rows), pairs_per_budget), dtype=np.float32),
+        value_sup_valids=np.stack(valid_rows, axis=0).astype(np.float32),
         value_sup_distances=np.stack(distances, axis=0).astype(np.float32),
     )
+
+
+def supervised_valid_counts(eval_budgets, supervised_budgets, pairs_per_budget):
+    """Per-budget direct-label counts for budget-holdout experiments."""
+    supervised_set = {int(x) for x in supervised_budgets}
+    counts = {}
+    for budget in eval_budgets:
+        budget = int(budget)
+        if budget in supervised_set:
+            counts[budget] = int(pairs_per_budget)
+        elif FLAGS.parent_label_pairs_per_budget >= 0:
+            counts[budget] = int(FLAGS.parent_label_pairs_per_budget)
+        else:
+            counts[budget] = int(round(float(FLAGS.parent_label_budget_frac) * pairs_per_budget))
+    return counts
 
 
 def bce_loss(pred_logit, target):
@@ -620,6 +724,9 @@ def sample_grid_qv_transitive_pairs(dataset, context, split, budgets, batch_size
     unique_witness_fracs = []
     replacement_used = []
     witness_fallback_used = []
+    qv_parent_oracle_labels = []
+    qv_left_oracle_labels = []
+    qv_right_oracle_labels = []
 
     attempts = 0
     max_attempts = max(1000, int(batch_size) * 200)
@@ -679,6 +786,7 @@ def sample_grid_qv_transitive_pairs(dataset, context, split, budgets, batch_size
         value_budgets.append(budget)
         value_offsets.append(parent_distance)
         parent_distances.append(parent_distance)
+        qv_parent_oracle_labels.append(float(parent_distance <= goal_hi))
         witness_cell_counts.append(float(len(selection["witness_cells"])))
         witness_candidate_counts.append(float(len(selection["candidate_cells"])))
         effective_unique_witness_counts.append(
@@ -699,6 +807,8 @@ def sample_grid_qv_transitive_pairs(dataset, context, split, budgets, batch_size
         parent_right_distances = []
         parent_left_slacks = []
         parent_right_slacks = []
+        parent_left_oracle_labels = []
+        parent_right_oracle_labels = []
         for witness_cell in sampled_witness_cells:
             witness_cell = int(witness_cell)
             witness_idx = int(rng.choice(state_by_cell[witness_cell]))
@@ -717,6 +827,8 @@ def sample_grid_qv_transitive_pairs(dataset, context, split, budgets, batch_size
             parent_right_distances.append(right_distance)
             parent_left_slacks.append(left_remaining - left_distance)
             parent_right_slacks.append(float(right_budget) - right_distance)
+            parent_left_oracle_labels.append(float(left_distance <= left_remaining))
+            parent_right_oracle_labels.append(float(right_distance <= float(right_budget)))
 
         witness_observations.append(parent_witness_observations)
         witness_actions.append(parent_witness_actions)
@@ -729,6 +841,8 @@ def sample_grid_qv_transitive_pairs(dataset, context, split, budgets, batch_size
         right_distances.append(parent_right_distances)
         left_slacks.append(parent_left_slacks)
         right_slacks.append(parent_right_slacks)
+        qv_left_oracle_labels.append(parent_left_oracle_labels)
+        qv_right_oracle_labels.append(parent_right_oracle_labels)
 
     if len(observations) < int(batch_size):
         raise ValueError(
@@ -776,6 +890,13 @@ def sample_grid_qv_transitive_pairs(dataset, context, split, budgets, batch_size
         qv_unique_witness_fracs=np.asarray(unique_witness_fracs, dtype=np.float32),
         qv_replacement_used=np.asarray(replacement_used, dtype=np.float32),
         qv_witness_fallback_used=np.asarray(witness_fallback_used, dtype=np.float32),
+        qv_parent_oracle_labels=np.asarray(qv_parent_oracle_labels, dtype=np.float32),
+        qv_left_oracle_labels=np.swapaxes(
+            np.asarray(qv_left_oracle_labels, dtype=np.float32), 0, 1
+        ),
+        qv_right_oracle_labels=np.swapaxes(
+            np.asarray(qv_right_oracle_labels, dtype=np.float32), 0, 1
+        ),
         qv_sample_acceptance_rate=np.asarray(
             float(len(observations)) / float(max(attempts, 1)), dtype=np.float32
         ),
@@ -792,6 +913,7 @@ def qv_transitive_loss(
     value_agent,
     qv_trans_loss_type,
     qv_trans_bce_margin,
+    qv_branch_mode,
     trans_budgets,
 ):
     parent_logits = agent.critic_logits_for(
@@ -818,23 +940,30 @@ def qv_transitive_loss(
         batch["qv_goals"][None, ...], witness_shape + batch["qv_goals"].shape[-1:]
     )
 
-    first_logits = agent.critic_logits_for_pair_grid(
-        parent_observations,
-        parent_actions,
-        witness_goals,
-        batch["qv_left_budgets"],
-        offsets=batch["qv_midpoint_offsets"],
-        target=True,
-    )
-    second_logits = value_agent.critic_logits_for_pair_grid(
-        batch["qv_midpoint_observations"],
-        batch["qv_midpoint_actions"],
-        parent_goals,
-        batch["qv_right_budgets"],
-        offsets=batch["qv_right_budgets"],
-    )
-    first_r = jax.nn.sigmoid(first_logits)
-    second_r = jax.nn.sigmoid(second_logits)
+    if qv_branch_mode in ("oracle_q_frozen_v", "oracle_q_oracle_v"):
+        first_r = jnp.asarray(batch["qv_left_oracle_labels"], dtype=parent_logits.dtype)
+    else:
+        first_logits = agent.critic_logits_for_pair_grid(
+            parent_observations,
+            parent_actions,
+            witness_goals,
+            batch["qv_left_budgets"],
+            offsets=batch["qv_midpoint_offsets"],
+            target=True,
+        )
+        first_r = jax.nn.sigmoid(first_logits)
+
+    if qv_branch_mode == "oracle_q_oracle_v":
+        second_r = jnp.asarray(batch["qv_right_oracle_labels"], dtype=parent_logits.dtype)
+    else:
+        second_logits = value_agent.critic_logits_for_pair_grid(
+            batch["qv_midpoint_observations"],
+            batch["qv_midpoint_actions"],
+            parent_goals,
+            batch["qv_right_budgets"],
+            offsets=batch["qv_right_budgets"],
+        )
+        second_r = jax.nn.sigmoid(second_logits)
     witness_valids = jnp.asarray(batch["qv_valids"], dtype=first_r.dtype)
     y_candidates = jnp.minimum(first_r, second_r)
     y_candidates = jnp.where(witness_valids[None, ...] > 0, y_candidates, -1.0)
@@ -874,6 +1003,18 @@ def qv_transitive_loss(
         qv_first_q_mean=masked_mean(first_r, witness_valids),
         qv_second_v_mean=masked_mean(second_r, witness_valids),
         qv_valid_frac=trans_valids.mean(),
+        qv_parent_oracle_label_mean=masked_mean(
+            jnp.asarray(batch["qv_parent_oracle_labels"], dtype=parent_logits.dtype),
+            trans_valids,
+        ),
+        qv_left_oracle_label_mean=masked_mean(
+            jnp.asarray(batch["qv_left_oracle_labels"], dtype=parent_logits.dtype),
+            witness_valids,
+        ),
+        qv_right_oracle_label_mean=masked_mean(
+            jnp.asarray(batch["qv_right_oracle_labels"], dtype=parent_logits.dtype),
+            witness_valids,
+        ),
     )
     qv_budgets = jnp.asarray(batch["qv_budgets"], dtype=parent_logits.dtype)
     for budget in tuple(int(x) for x in trans_budgets):
@@ -899,6 +1040,97 @@ def qv_transitive_loss(
         info[f"qv_second_v_mean_by_budget/{budget_key}"] = masked_mean(
             second_r, witness_budget_mask
         )
+        info[f"qv_target_minus_parent_mean_by_budget/{budget_key}"] = masked_mean(
+            target_minus_parent, parent_budget_mask
+        )
+        info[f"qv_frac_y_trans_gt_parent_by_budget/{budget_key}"] = masked_mean(
+            (target_minus_parent > 0.0).astype(parent_logits.dtype),
+            parent_budget_mask,
+        )
+        info[f"qv_frac_y_trans_lt_parent_by_budget/{budget_key}"] = masked_mean(
+            (target_minus_parent < 0.0).astype(parent_logits.dtype),
+            parent_budget_mask,
+        )
+    return loss, info
+
+
+def vnext_distill_loss(
+    agent,
+    batch,
+    grad_params,
+    value_agent,
+    vnext_distill_loss_type,
+    vnext_distill_bce_margin,
+    budgets,
+):
+    parent_logits = agent.critic_logits_for_pair_grid(
+        batch["value_sup_observations"],
+        batch["value_sup_actions"],
+        batch["value_sup_goals"],
+        batch["value_sup_budgets"],
+        offsets=batch["value_sup_offsets"],
+        grad_params=grad_params,
+    )
+    parent_r = jax.nn.sigmoid(parent_logits)
+    target_logits = value_agent.critic_logits_for_pair_grid(
+        batch["value_sup_next_observations"],
+        batch["value_sup_actions"],
+        batch["value_sup_goals"],
+        batch["value_sup_remaining_budgets"],
+        offsets=batch["value_sup_offsets"],
+    )
+    target_r = jax.lax.stop_gradient(jax.nn.sigmoid(target_logits))
+    valids = jnp.asarray(batch["value_sup_valids"], dtype=parent_logits.dtype)
+    bce = bce_loss(parent_logits, target_r)
+    target_minus_parent = target_r - parent_r
+    if vnext_distill_loss_type == "bce_equal":
+        loss_values = bce
+        loss_mask = valids
+    elif vnext_distill_loss_type == "prob_hinge":
+        loss_values = jnp.square(jnp.maximum(target_minus_parent, 0.0))
+        loss_mask = valids
+    elif vnext_distill_loss_type == "bce_lower_bound":
+        gate = jax.lax.stop_gradient(
+            (target_minus_parent > vnext_distill_bce_margin).astype(
+                parent_logits.dtype
+            )
+        )
+        loss_values = bce
+        loss_mask = valids * gate
+    else:
+        raise ValueError(
+            f"Unsupported vnext_distill_loss_type={vnext_distill_loss_type}"
+        )
+    loss = masked_mean(loss_values, loss_mask)
+    info = dict(
+        loss_vnext_distill=loss,
+        vnext_parent_r_mean=masked_mean(parent_r, valids),
+        vnext_target_r_mean=masked_mean(target_r, valids),
+        vnext_target_minus_parent_mean=masked_mean(target_minus_parent, valids),
+        vnext_frac_target_gt_parent=masked_mean(
+            (target_minus_parent > 0.0).astype(parent_logits.dtype), valids
+        ),
+        vnext_frac_target_lt_parent=masked_mean(
+            (target_minus_parent < 0.0).astype(parent_logits.dtype), valids
+        ),
+        vnext_valid_frac=valids.mean(),
+    )
+    sup_budgets = jnp.asarray(batch["value_sup_budgets"], dtype=parent_logits.dtype)
+    for budget in tuple(int(x) for x in budgets):
+        budget_key = f"H{budget}"
+        budget_mask = valids * (sup_budgets == float(budget)).astype(parent_logits.dtype)
+        info[f"loss_vnext_distill_by_budget/{budget_key}"] = masked_mean(
+            loss_values, budget_mask
+        )
+        info[f"vnext_parent_r_mean_by_budget/{budget_key}"] = masked_mean(
+            parent_r, budget_mask
+        )
+        info[f"vnext_target_r_mean_by_budget/{budget_key}"] = masked_mean(
+            target_r, budget_mask
+        )
+        info[f"vnext_target_minus_parent_mean_by_budget/{budget_key}"] = masked_mean(
+            target_minus_parent, budget_mask
+        )
     return loss, info
 
 
@@ -909,26 +1141,51 @@ def update_with_qv_trans(
     lambda_qv_trans,
     qv_trans_loss_type="bce_equal",
     qv_trans_bce_margin=0.0,
+    lambda_vnext_distill=0.0,
+    vnext_distill_loss_type="bce_equal",
+    vnext_distill_bce_margin=0.0,
+    qv_branch_mode="learned_q_frozen_v",
     trans_budgets=(),
+    budgets=(),
+    use_qv_trans=True,
+    use_vnext_distill=False,
 ):
     new_rng, rng = jax.random.split(agent.rng)
 
     def loss_fn(grad_params):
         critic_loss, critic_info = agent.critic_loss(batch, grad_params)
-        qv_loss, qv_info = qv_transitive_loss(
-            agent,
-            batch,
-            grad_params,
-            value_agent,
-            qv_trans_loss_type,
-            qv_trans_bce_margin,
-            trans_budgets,
-        )
-        loss = critic_loss + lambda_qv_trans * qv_loss
+        loss = critic_loss
         info = {f"critic/{key}": value for key, value in critic_info.items()}
-        for key, value in qv_info.items():
-            info[f"critic/{key}"] = value
-        info["critic/total_loss_with_qv"] = loss
+        if use_qv_trans:
+            qv_loss, qv_info = qv_transitive_loss(
+                agent,
+                batch,
+                grad_params,
+                value_agent,
+                qv_trans_loss_type,
+                qv_trans_bce_margin,
+                qv_branch_mode,
+                trans_budgets,
+            )
+            loss = loss + lambda_qv_trans * qv_loss
+            for key, value in qv_info.items():
+                info[f"critic/{key}"] = value
+        if use_vnext_distill:
+            vnext_loss, vnext_info = vnext_distill_loss(
+                agent,
+                batch,
+                grad_params,
+                value_agent,
+                vnext_distill_loss_type,
+                vnext_distill_bce_margin,
+                budgets,
+            )
+            loss = loss + lambda_vnext_distill * vnext_loss
+            for key, value in vnext_info.items():
+                info[f"critic/{key}"] = value
+        info["critic/total_loss_with_aux"] = loss
+        if use_qv_trans:
+            info["critic/total_loss_with_qv"] = loss
         return loss, info
 
     new_network, info = agent.network.apply_loss_fn(loss_fn=loss_fn)
@@ -938,7 +1195,15 @@ def update_with_qv_trans(
 
 update_with_qv_trans = jax.jit(
     update_with_qv_trans,
-    static_argnames=("qv_trans_loss_type", "trans_budgets"),
+    static_argnames=(
+        "qv_trans_loss_type",
+        "vnext_distill_loss_type",
+        "qv_branch_mode",
+        "trans_budgets",
+        "budgets",
+        "use_qv_trans",
+        "use_vnext_distill",
+    ),
 )
 
 
@@ -1163,6 +1428,9 @@ def summarize_qv_transitive_batch(batch, budgets):
     right_distances = np.asarray(batch["qv_right_distances"])
     left_slacks = np.asarray(batch["qv_left_slacks"])
     right_slacks = np.asarray(batch["qv_right_slacks"])
+    parent_oracle_labels = np.asarray(batch.get("qv_parent_oracle_labels", np.nan))
+    left_oracle_labels = np.asarray(batch.get("qv_left_oracle_labels", np.nan))
+    right_oracle_labels = np.asarray(batch.get("qv_right_oracle_labels", np.nan))
     rows = []
     for budget in budgets:
         budget = int(budget)
@@ -1202,6 +1470,9 @@ def summarize_qv_transitive_batch(batch, budgets):
                 zero_right_frac=finite_mean(
                     (right_distances[witness_mask] <= 1e-6).astype(np.float32)
                 ),
+                parent_oracle_label_mean=finite_mean(parent_oracle_labels[parent_mask]),
+                left_oracle_label_mean=finite_mean(left_oracle_labels[witness_mask]),
+                right_oracle_label_mean=finite_mean(right_oracle_labels[witness_mask]),
             )
         )
     return dict(
@@ -1209,6 +1480,7 @@ def summarize_qv_transitive_batch(batch, budgets):
         qv_attempts_per_sample=float(np.asarray(batch["qv_attempts_per_sample"])),
         num_trans_witnesses=int(np.asarray(qv_valids).shape[0]),
         trans_witness_mode=str(FLAGS.trans_witness_mode),
+        qv_branch_mode=str(FLAGS.qv_branch_mode),
         budget_rows=rows,
     )
 
@@ -1222,6 +1494,7 @@ def print_qv_summary(summary, info):
         f"attempts/sample={format_metric(summary['qv_attempts_per_sample'])} | "
         f"K={summary['num_trans_witnesses']} | "
         f"mode={summary['trans_witness_mode']} | "
+        f"branch={summary['qv_branch_mode']} | "
         f"loss={format_metric(info.get('critic/loss_qv_trans', np.nan))}"
     )
     print(
@@ -1291,8 +1564,17 @@ def main(_):
     if config["agent_name"] != "bmm_trl":
         raise ValueError("train_bmm_geodesic_q.py requires bmm_trl.")
     budgets = parse_budgets(FLAGS.budgets)
+    eval_budgets = budgets if FLAGS.eval_budgets is None else parse_budgets(FLAGS.eval_budgets)
+    supervised_budgets = (
+        budgets
+        if FLAGS.supervised_budgets is None
+        else parse_budgets(FLAGS.supervised_budgets)
+    )
     trans_budgets = (
         budgets if FLAGS.trans_budgets is None else parse_budgets(FLAGS.trans_budgets)
+    )
+    config_budgets = tuple(
+        sorted(set(budgets) | set(eval_budgets) | set(supervised_budgets) | set(trans_budgets))
     )
     sup_pairs_per_budget = positive_or_default(
         FLAGS.sup_pairs_per_budget, FLAGS.batch_size
@@ -1300,7 +1582,15 @@ def main(_):
     trans_pairs_per_update = positive_or_default(
         FLAGS.trans_pairs_per_update, FLAGS.batch_size
     )
-    configure_agent(config, budgets)
+    train_sup_valid_counts = supervised_valid_counts(
+        eval_budgets, supervised_budgets, sup_pairs_per_budget
+    )
+    train_sup_budgets = tuple(
+        budget for budget in eval_budgets if train_sup_valid_counts.get(int(budget), 0) > 0
+    )
+    if not train_sup_budgets:
+        raise ValueError("At least one budget must have direct supervised labels.")
+    configure_agent(config, config_budgets)
 
     xy_dims = parse_xy_dims(FLAGS.xy_dims)
     dataset_path = dataset_path_from_dir(FLAGS.dataset_dir)
@@ -1313,10 +1603,18 @@ def main(_):
     print(f"  label_type: {context['kind']}")
     print(f"  geodesic_budget_unit: {FLAGS.geodesic_budget_unit}")
     print(f"  budgets: {budgets}")
+    print(f"  config_budgets: {config_budgets}")
+    print(f"  eval_budgets: {eval_budgets}")
+    print(f"  supervised_budgets: {supervised_budgets}")
+    print(f"  train_sup_valid_counts: {train_sup_valid_counts}")
     print(f"  trans_budgets: {trans_budgets}")
     print(f"  lambda_qv_trans: {FLAGS.lambda_qv_trans}")
     print(f"  qv_trans_loss_type: {FLAGS.qv_trans_loss_type}")
     print(f"  qv_trans_bce_margin: {FLAGS.qv_trans_bce_margin}")
+    print(f"  lambda_vnext_distill: {FLAGS.lambda_vnext_distill}")
+    print(f"  vnext_distill_loss_type: {FLAGS.vnext_distill_loss_type}")
+    print(f"  vnext_distill_bce_margin: {FLAGS.vnext_distill_bce_margin}")
+    print(f"  qv_branch_mode: {FLAGS.qv_branch_mode}")
     print(f"  num_trans_witnesses: {FLAGS.num_trans_witnesses}")
     print(f"  trans_witness_mode: {FLAGS.trans_witness_mode}")
     print(f"  sup_pairs_per_budget: {sup_pairs_per_budget}")
@@ -1342,24 +1640,27 @@ def main(_):
         value_agent = restore_agent(
             value_agent, FLAGS.value_restore_path, FLAGS.value_restore_epoch
         )
-    if FLAGS.lambda_qv_trans > 0.0 and value_agent is None:
+    qv_needs_value_agent = (
+        FLAGS.lambda_qv_trans > 0.0 and FLAGS.qv_branch_mode != "oracle_q_oracle_v"
+    )
+    if (qv_needs_value_agent or FLAGS.lambda_vnext_distill > 0.0) and value_agent is None:
         raise ValueError(
-            "--lambda_qv_trans > 0 requires --value_restore_path and "
-            "--value_restore_epoch for the frozen V teacher."
+            "This run requires --value_restore_path and --value_restore_epoch for "
+            "the frozen V teacher."
         )
 
     eval_batch = make_sup_fields(
         val_dataset,
         context,
         "val",
-        budgets,
+        eval_budgets,
         FLAGS.eval_pairs,
         rng,
     )
     final_loss = None
     train_report = None
-    eval_report = score_sup_batch(agent, eval_batch, budgets, value_agent=value_agent)
-    eval_mono = monotonicity_violation(agent, eval_batch, budgets)
+    eval_report = score_sup_batch(agent, eval_batch, eval_budgets, value_agent=value_agent)
+    eval_mono = monotonicity_violation(agent, eval_batch, eval_budgets)
     print_report("eval", 0, eval_report, mono=eval_mono)
     last_update_info = {}
     qv_history = []
@@ -1386,12 +1687,13 @@ def main(_):
                 train_dataset,
                 context,
                 "train",
-                budgets,
+                train_sup_budgets,
                 sup_pairs_per_budget,
                 rng,
+                valid_counts=train_sup_valid_counts,
             )
         )
-        if FLAGS.lambda_qv_trans > 0.0:
+        if FLAGS.lambda_qv_trans > 0.0 or FLAGS.lambda_vnext_distill > 0.0:
             agent, info = update_with_qv_trans(
                 agent,
                 train_batch,
@@ -1399,7 +1701,14 @@ def main(_):
                 FLAGS.lambda_qv_trans,
                 qv_trans_loss_type=FLAGS.qv_trans_loss_type,
                 qv_trans_bce_margin=FLAGS.qv_trans_bce_margin,
+                lambda_vnext_distill=FLAGS.lambda_vnext_distill,
+                vnext_distill_loss_type=FLAGS.vnext_distill_loss_type,
+                vnext_distill_bce_margin=FLAGS.vnext_distill_bce_margin,
+                qv_branch_mode=FLAGS.qv_branch_mode,
                 trans_budgets=trans_budgets,
+                budgets=config_budgets,
+                use_qv_trans=FLAGS.lambda_qv_trans > 0.0,
+                use_vnext_distill=FLAGS.lambda_vnext_distill > 0.0,
             )
         else:
             agent, info = agent.update(train_batch)
@@ -1407,13 +1716,13 @@ def main(_):
         final_loss = float(info["critic/loss_sup"])
         if step % FLAGS.eval_interval == 0 or step == FLAGS.steps:
             train_report = score_sup_batch(
-                agent, train_batch, budgets, value_agent=value_agent
+                agent, train_batch, eval_budgets, value_agent=value_agent
             )
             eval_report = score_sup_batch(
-                agent, eval_batch, budgets, value_agent=value_agent
+                agent, eval_batch, eval_budgets, value_agent=value_agent
             )
-            train_mono = monotonicity_violation(agent, train_batch, budgets)
-            eval_mono = monotonicity_violation(agent, eval_batch, budgets)
+            train_mono = monotonicity_violation(agent, train_batch, eval_budgets)
+            eval_mono = monotonicity_violation(agent, eval_batch, eval_budgets)
             last_qv_summary = summarize_qv_transitive_batch(qv_fields, trans_budgets)
             if last_qv_summary is not None:
                 qv_history.append(dict(step=int(step), train=last_qv_summary))
@@ -1421,7 +1730,7 @@ def main(_):
             print_qv_summary(last_qv_summary, last_update_info)
             print_report("eval", step, eval_report, mono=eval_mono)
 
-    final_passed = passed(eval_report, budgets)
+    final_passed = passed(eval_report, eval_budgets)
     print(f"\nFinal heldout threshold pass: {final_passed}")
     final_report = dict(
         train=train_report,
@@ -1435,6 +1744,13 @@ def main(_):
             env_name=FLAGS.env_name,
             reachability_label_type=FLAGS.reachability_label_type,
             budgets=[int(x) for x in budgets],
+            config_budgets=[int(x) for x in config_budgets],
+            eval_budgets=[int(x) for x in eval_budgets],
+            supervised_budgets=[int(x) for x in supervised_budgets],
+            train_sup_budgets=[int(x) for x in train_sup_budgets],
+            train_sup_valid_counts={str(k): int(v) for k, v in train_sup_valid_counts.items()},
+            parent_label_budget_frac=float(FLAGS.parent_label_budget_frac),
+            parent_label_pairs_per_budget=int(FLAGS.parent_label_pairs_per_budget),
             trans_budgets=[int(x) for x in trans_budgets],
             batch_size=int(FLAGS.batch_size),
             sup_pairs_per_budget=int(sup_pairs_per_budget),
@@ -1446,6 +1762,10 @@ def main(_):
             lambda_qv_trans=float(FLAGS.lambda_qv_trans),
             qv_trans_loss_type=str(FLAGS.qv_trans_loss_type),
             qv_trans_bce_margin=float(FLAGS.qv_trans_bce_margin),
+            lambda_vnext_distill=float(FLAGS.lambda_vnext_distill),
+            vnext_distill_loss_type=str(FLAGS.vnext_distill_loss_type),
+            vnext_distill_bce_margin=float(FLAGS.vnext_distill_bce_margin),
+            qv_branch_mode=str(FLAGS.qv_branch_mode),
             trans_pos_boundary_frac=float(FLAGS.trans_pos_boundary_frac),
             num_trans_witnesses=int(FLAGS.num_trans_witnesses),
             trans_witness_mode=str(FLAGS.trans_witness_mode),
