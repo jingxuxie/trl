@@ -241,9 +241,194 @@ Near-duplicate counts at the default raw xy radius were low, so the main signal
 is high local entropy/ambiguous neighbor labels rather than many exact duplicate
 contradictions.
 
+## PointMaze Graph-Target Diagnostics
+
+Following `BMM_TRL_POINTMAZE_TARGET_PLAN.md`, I added a separate graph-target
+diagnostic path instead of modifying the logged-offset evaluator:
+
+```text
+scripts/inspect_pointmaze_observation_layout.py
+scripts/build_bmm_pointmaze_graph.py
+scripts/eval_bmm_graph_reachability.py
+scripts/debug_bmm_graph_fixed_batch_overfit.py
+scripts/test_bmm_pointmaze_graph.py
+utils/pointmaze_graph.py
+```
+
+Observation-layout inspection confirms PointMaze observations are xy-only:
+
+```bash
+conda run -n bmm-trl python scripts/inspect_pointmaze_observation_layout.py \
+    --env_name=pointmaze-medium-navigate-v0
+```
+
+Key output:
+
+| item | value |
+|---|---:|
+| train observation shape | `(1001000, 2)` |
+| validation observation shape | `(100100, 2)` |
+| train terminals | `2000` |
+| validation terminals | `200` |
+| xy dims | `(0, 1)` |
+| combined median nonzero one-step xy displacement | `0.202063` |
+
+The env also exposes `maze_map`, `_maze_type=medium`, and `_maze_unit=4.0`.
+
+I then built a conservative dataset-position graph:
+
+```bash
+conda run -n bmm-trl python scripts/build_bmm_pointmaze_graph.py \
+    --env_name=pointmaze-medium-navigate-v0 \
+    --output=exp/bmm_pointmaze_graph.npz
+```
+
+The graph uses occupied xy bins from train+validation and only observed
+consecutive transition edges. It does not add broad kNN/geometric edges, so it
+should avoid wall shortcuts.
+
+Graph summary:
+
+| item | value |
+|---|---:|
+| bin size | `0.404126` |
+| env steps per graph edge | `2.0` |
+| nodes | `1698` |
+| undirected observed-transition edges | `5548` |
+| connected components | `1` |
+| graph diameter | `73` hops / `146` calibrated steps |
+| mean finite distance | `30.49` hops / `60.99` calibrated steps |
+
+This diameter is important: under this dataset-support graph, budgets
+`H >= 160` have no negative examples because all occupied bins are reachable
+within the calibrated graph diameter. Therefore an all-positive graph label at
+`H=256/512` is expected, unlike the logged-offset diagnostic where high-budget
+negatives came from behavior-time detours.
+
+Graph-label baseline/kNN sweep:
+
+```bash
+conda run -n bmm-trl python scripts/eval_bmm_graph_reachability.py \
+    --env_name=pointmaze-medium-navigate-v0 \
+    --graph_path=exp/bmm_pointmaze_graph.npz \
+    --budgets=32,64,96,128,144,160,256,512 \
+    --num_train_pairs=8192 \
+    --num_eval_pairs=2048 \
+    --output_json=exp/bmm_graph_reachability_budget_sweep_8k_2k.json
+```
+
+Selected rows:
+
+| H | graph oracle AUC | Euclidean AUC | kNN xy_delta AUC | kNN xy_delta gap | pos n | neg n |
+|---:|---:|---:|---:|---:|---:|---:|
+| 32 | 1.0000 | 0.9878 | 0.9956 | 0.8118 | 1024 | 1024 |
+| 64 | 1.0000 | 0.9242 | 0.9852 | 0.7548 | 1024 | 1024 |
+| 96 | 1.0000 | 0.9402 | 0.9956 | 0.8744 | 1024 | 1024 |
+| 128 | 1.0000 | 0.8343 | 0.9972 | 0.9315 | 1024 | 1024 |
+| 144 | nan | nan | nan | nan | 1024 | 0 |
+| 160 | nan | nan | nan | nan | 1024 | 0 |
+| 256 | nan | nan | nan | nan | 1024 | 0 |
+| 512 | nan | nan | nan | nan | 1024 | 0 |
+
+Interpretation: graph-distance labels are clean and locally identifiable for
+budgets below the graph diameter. Above the graph diameter, one-class rows are
+not a failure; they mean this graph target considers the whole observed support
+reachable within the budget.
+
+Finally, I ran a state-only BMM critic fixed-batch diagnostic on graph labels:
+
+```bash
+conda run -n bmm-trl python scripts/debug_bmm_graph_fixed_batch_overfit.py \
+    --env_name=pointmaze-medium-navigate-v0 \
+    --graph_path=exp/bmm_pointmaze_graph.npz \
+    --budgets="(32, 64, 96, 128)" \
+    --batch_size=256 \
+    --steps=1000 \
+    --eval_interval=200 \
+    --agent.value_hidden_dims="(256, 256)" \
+    --agent.actor_hidden_dims="(256, 256)" \
+    --agent.layer_norm=False \
+    --output_json=exp/bmm_graph_fixed_batch_overfit_state.json
+```
+
+It passed the fixed-batch train target at step `600`. Heldout graph-label
+metrics at step `600`:
+
+| H | eval AUC | eval gap | eval pos mean | eval neg mean | eval min AUC | eval min gap |
+|---:|---:|---:|---:|---:|---:|---:|
+| 32 | 0.9474 | 0.5239 | 0.8679 | 0.3440 | 0.9445 | 0.5277 |
+| 64 | 0.9413 | 0.5047 | 0.8370 | 0.3323 | 0.9394 | 0.5066 |
+| 96 | 0.9728 | 0.6839 | 0.8241 | 0.1403 | 0.9734 | 0.6815 |
+| 128 | 0.9921 | 0.8095 | 0.8225 | 0.0130 | 0.9915 | 0.7899 |
+
+This is the first positive evidence that replacing logged-offset high-budget
+labels with a maze-aware dataset-support graph target produces a learnable
+PointMaze reachability diagnostic.
+
+## PointMaze Layout/Grid BFS Check
+
+Since the env exposes `maze_map`, I also added a layout BFS utility and test:
+
+```text
+scripts/inspect_pointmaze_grid_bfs.py
+scripts/test_pointmaze_grid_bfs.py
+utils/pointmaze_grid.py
+```
+
+The synthetic test verifies that BFS follows corridors and does not take a
+Euclidean shortcut through a wall:
+
+```bash
+conda run -n bmm-trl python scripts/test_pointmaze_grid_bfs.py
+```
+
+PointMaze medium layout diagnostic:
+
+```bash
+conda run -n bmm-trl python scripts/inspect_pointmaze_grid_bfs.py \
+    --env_name=pointmaze-medium-navigate-v0 \
+    --budgets=32,64,96,128,160,224,256,512
+```
+
+Key output:
+
+| item | value |
+|---|---:|
+| maze type | `medium` |
+| maze unit | `4.0` |
+| median step xy | `0.202063` |
+| steps per cell | `19.7958` |
+| free cells | `26` |
+| max grid distance | `11` cells / `217.75` steps |
+| train free-cell coverage | `1001000 / 1001000` |
+| validation free-cell coverage | `100100 / 100100` |
+| occupied free cells | `26 / 26` |
+
+Budget class coverage over all free-cell pairs:
+
+| H | positive cell pairs | negative cell pairs |
+|---:|---:|---:|
+| 32 | 82 | 594 |
+| 64 | 212 | 464 |
+| 96 | 292 | 384 |
+| 128 | 480 | 196 |
+| 160 | 620 | 56 |
+| 224 | 676 | 0 |
+| 256 | 676 | 0 |
+| 512 | 676 | 0 |
+
+This independently confirms the graph-target result: for the true medium maze
+layout, `H=256` and `H=512` are beyond the calibrated grid diameter. A clean
+geodesic reachability target should be all-positive at those budgets on this
+environment. The old logged-offset high-budget negatives were therefore not
+true reachability negatives; they were behavior-time negatives.
+
 ## Recommended Next Diagnostics
 
-- Add a geodesic or graph-distance proxy diagnostic for PointMaze.
+- Add a graph/grid-label training path or custom trainer for more than one
+  frozen batch before returning to BMM max-min consistency.
+- For action-conditioned diagnostics, label `Q_H(s,a,g)` from the logged next
+  state: `1[d_graph(s_next, g) <= H - 1]`.
 - Try a small train/eval split from the same frozen balanced pair pool to
   separate local interpolation from trajectory/validation split generalization.
 - Add a position-only diagnostic if the observation layout is reliable, but the
