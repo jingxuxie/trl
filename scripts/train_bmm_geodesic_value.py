@@ -30,6 +30,7 @@ from utils.pointmaze_graph import (
     parse_xy_dims,
     sample_graph_budget_pairs,
     save_graph_npz,
+    source_indices,
 )
 from utils.pointmaze_grid import (
     free_cell_distance_matrix,
@@ -73,6 +74,16 @@ flags.DEFINE_float("target_auc", 0.90, "Default passing AUC threshold.")
 flags.DEFINE_float("target_gap", 0.20, "Default passing score-gap threshold.")
 flags.DEFINE_float("target_auc_128", 0.85, "Passing AUC threshold for H>=128.")
 flags.DEFINE_float("target_gap_128", 0.15, "Passing score-gap threshold for H>=128.")
+flags.DEFINE_float(
+    "lambda_trans",
+    0.0,
+    "Optional geodesic-valid max-min transitive consistency weight.",
+)
+flags.DEFINE_float(
+    "trans_pos_boundary_frac",
+    0.5,
+    "Transitive source-goal lower distance bound as a fraction of budget.",
+)
 flags.DEFINE_bool(
     "fail_on_threshold",
     False,
@@ -113,7 +124,7 @@ def configure_agent(config, budgets):
     config.lambda_sup = 1.0
     config.lambda_rank = 0.0
     config.lambda_mono = 0.0
-    config.lambda_trans = 0.0
+    config.lambda_trans = FLAGS.lambda_trans
     config.lambda_pos = 0.0
     config.lambda_budget_neg = 0.0
     config.lambda_hard_neg = 0.0
@@ -275,6 +286,109 @@ def make_sup_fields(dataset, context, split, budgets, pairs_per_budget, rng):
         value_sup_labels=np.stack([row["labels"] for row in rows], axis=0),
         value_sup_valids=np.ones((len(rows), pairs_per_budget), dtype=np.float32),
         value_sup_distances=np.stack(distances, axis=0).astype(np.float32),
+    )
+
+
+def sample_grid_transitive_v_pairs(dataset, context, split, budgets, batch_size, rng):
+    """Sample geodesic-valid state-only transitive tuples for BMM V_H."""
+    if context["kind"] != "grid_geodesic":
+        raise ValueError("Geodesic transitive V sampling currently supports grid labels.")
+
+    state_to_cell = np.asarray(context[f"{split}_state_to_cell"], dtype=np.int32)
+    state_by_cell = context[f"{split}_goal_by_cell"]
+    has_state = np.asarray([len(items) > 0 for items in state_by_cell])
+    step_distances = np.asarray(context["cell_distances"], dtype=np.float32) * float(
+        context["steps_per_cell"]
+    )
+    src_idxs = source_indices(dataset)
+    src_idxs = src_idxs[state_to_cell[src_idxs] >= 0]
+    budgets = tuple(int(x) for x in budgets)
+
+    observations = []
+    actions = []
+    goals = []
+    value_budgets = []
+    value_offsets = []
+    midpoint_observations = []
+    midpoint_actions = []
+    midpoint_goals = []
+    midpoint_offsets = []
+    left_budgets = []
+    right_budgets = []
+    trans_valids = []
+
+    attempts = 0
+    max_attempts = max(1000, int(batch_size) * 200)
+    while len(observations) < int(batch_size) and attempts < max_attempts:
+        attempts += 1
+        budget = int(rng.choice(budgets))
+        if budget <= 1:
+            continue
+        left_budget = max(1, budget // 2)
+        right_budget = max(1, budget - left_budget)
+        src_idx = int(rng.choice(src_idxs))
+        src_cell = int(state_to_cell[src_idx])
+        src_distances = step_distances[src_cell]
+        finite_goal = (context["cell_distances"][src_cell] >= 0) & has_state
+        goal_lo = max(0.0, float(FLAGS.trans_pos_boundary_frac) * float(budget))
+        goal_mask = (
+            finite_goal
+            & (src_distances >= goal_lo)
+            & (src_distances <= float(budget))
+        )
+        if not goal_mask.any() and goal_lo > 0.0:
+            goal_mask = finite_goal & (src_distances <= float(budget))
+        goal_cells = np.nonzero(goal_mask)[0]
+        if len(goal_cells) == 0:
+            continue
+
+        goal_cell = int(rng.choice(goal_cells))
+        witness_mask = (
+            has_state
+            & (context["cell_distances"][src_cell] >= 0)
+            & (context["cell_distances"][:, goal_cell] >= 0)
+            & (src_distances <= float(left_budget))
+            & (step_distances[:, goal_cell] <= float(right_budget))
+        )
+        witness_cells = np.nonzero(witness_mask)[0]
+        if len(witness_cells) == 0:
+            continue
+
+        witness_cell = int(rng.choice(witness_cells))
+        goal_idx = int(rng.choice(state_by_cell[goal_cell]))
+        witness_idx = int(rng.choice(state_by_cell[witness_cell]))
+        observations.append(np.asarray(dataset["observations"])[src_idx])
+        actions.append(np.asarray(dataset["actions"])[src_idx])
+        goals.append(np.asarray(dataset["observations"])[goal_idx])
+        value_budgets.append(budget)
+        value_offsets.append(float(src_distances[goal_cell]))
+        midpoint_observations.append(np.asarray(dataset["observations"])[witness_idx])
+        midpoint_actions.append(np.asarray(dataset["actions"])[witness_idx])
+        midpoint_goals.append(np.asarray(dataset["observations"])[witness_idx])
+        midpoint_offsets.append(float(src_distances[witness_cell]))
+        left_budgets.append(left_budget)
+        right_budgets.append(right_budget)
+        trans_valids.append(1.0)
+
+    if len(observations) < int(batch_size):
+        raise ValueError(
+            f"Could not sample {batch_size} grid transitive tuples for split={split}; "
+            f"got {len(observations)} after {attempts} attempts."
+        )
+
+    return dict(
+        observations=np.asarray(observations, dtype=np.float32),
+        actions=np.asarray(actions, dtype=np.float32),
+        value_goals=np.asarray(goals, dtype=np.float32),
+        value_budgets=np.asarray(value_budgets, dtype=np.int32),
+        value_offsets=np.rint(value_offsets).astype(np.int32),
+        value_midpoint_observations=np.asarray(midpoint_observations, dtype=np.float32),
+        value_midpoint_actions=np.asarray(midpoint_actions, dtype=np.float32),
+        value_midpoint_goals=np.asarray(midpoint_goals, dtype=np.float32),
+        value_midpoint_offsets=np.rint(midpoint_offsets).astype(np.int32),
+        value_left_budgets=np.asarray(left_budgets, dtype=np.int32),
+        value_right_budgets=np.asarray(right_budgets, dtype=np.int32),
+        trans_valids=np.asarray(trans_valids, dtype=np.float32),
     )
 
 
@@ -448,6 +562,7 @@ def main(_):
     print(f"  env_name: {FLAGS.env_name}")
     print(f"  label_type: {context['kind']}")
     print(f"  budgets: {budgets}")
+    print(f"  lambda_trans: {FLAGS.lambda_trans}")
     print(f"  context: {context_metadata(context)}")
 
     dataset_class = {"GCDataset": GCDataset}[config["dataset"]["dataset_class"]]
@@ -471,6 +586,17 @@ def main(_):
 
     for step in range(1, FLAGS.steps + 1):
         train_batch = gc_train.sample(config.batch_size)
+        if FLAGS.lambda_trans > 0.0:
+            train_batch.update(
+                sample_grid_transitive_v_pairs(
+                    train_dataset,
+                    context,
+                    "train",
+                    budgets,
+                    config.batch_size,
+                    rng,
+                )
+            )
         train_batch.update(
             make_sup_fields(
                 train_dataset,
@@ -507,6 +633,8 @@ def main(_):
             steps=int(FLAGS.steps),
             eval_interval=int(FLAGS.eval_interval),
             final_loss_sup=final_loss,
+            lambda_trans=float(FLAGS.lambda_trans),
+            trans_pos_boundary_frac=float(FLAGS.trans_pos_boundary_frac),
             context=context_metadata(context),
         ),
     )
