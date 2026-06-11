@@ -10,9 +10,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from utils.datasets import Dataset
 from utils.pointmaze_grid import (
+    free_cell_to_state_indices,
     free_cell_distance_matrix,
     grid_distance_statistics,
+    ij_to_xy,
+    sample_grid_budget_pairs,
+    state_to_free_cell_indices,
     xy_pair_grid_distances,
 )
 
@@ -45,6 +50,35 @@ def main():
     )
     assert distances.shape == (1,)
     assert distances[0] == 6.0
+
+    observations = ij_to_xy(free_cells).astype(np.float32)
+    actions = np.zeros((len(observations), 2), dtype=np.float32)
+    terminals = np.zeros(len(observations), dtype=np.float32)
+    terminals[-1] = 1.0
+    valids = np.ones(len(observations), dtype=np.float32)
+    dataset = Dataset.create(
+        observations=observations,
+        actions=actions,
+        terminals=terminals,
+        valids=valids,
+    )
+    state_to_cell = state_to_free_cell_indices(dataset, maze_map, free_cells)
+    goal_by_cell = free_cell_to_state_indices(state_to_cell, len(free_cells))
+    pair_batch = sample_grid_budget_pairs(
+        dataset,
+        state_to_cell,
+        goal_by_cell,
+        cell_distances,
+        steps_per_cell=1.0,
+        budget=2,
+        num_pairs=64,
+        rng=np.random.default_rng(0),
+    )
+    assert pair_batch is not None
+    assert pair_batch["labels"].sum() > 0
+    assert (pair_batch["labels"] == 0).sum() > 0
+    assert np.all(pair_batch["grid_distances"][pair_batch["labels"] == 1] <= 2)
+    assert np.all(pair_batch["grid_distances"][pair_batch["labels"] == 0] > 2)
 
     print("PointMaze grid BFS checks passed.")
 

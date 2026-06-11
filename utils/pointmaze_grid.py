@@ -4,6 +4,8 @@ from collections import deque
 
 import numpy as np
 
+from utils.pointmaze_graph import dataset_xy, source_indices
+
 
 def unwrap_maze_env(env):
     """Return the innermost env object exposing maze_map."""
@@ -99,6 +101,142 @@ def xy_pair_grid_distances(
         if cell_distance >= 0:
             flat_result[idx] = float(cell_distance) * float(steps_per_cell)
     return result
+
+
+def state_to_free_cell_indices(
+    dataset,
+    maze_map,
+    free_cells,
+    xy_dims=(0, 1),
+    maze_unit=4.0,
+    offset_x=4.0,
+    offset_y=4.0,
+):
+    """Map each dataset state to a free-cell index; invalid states get -1."""
+    xy = dataset_xy(dataset, xy_dims)
+    ij = xy_to_ij(xy, maze_unit, offset_x, offset_y)
+    cell_to_idx = {tuple(cell): idx for idx, cell in enumerate(np.asarray(free_cells))}
+    result = np.full(len(xy), -1, dtype=np.int32)
+    maze_map = np.asarray(maze_map)
+    in_bounds = (
+        (ij[:, 0] >= 0)
+        & (ij[:, 0] < maze_map.shape[0])
+        & (ij[:, 1] >= 0)
+        & (ij[:, 1] < maze_map.shape[1])
+    )
+    valid_idxs = np.nonzero(in_bounds)[0]
+    for idx in valid_idxs:
+        cell = tuple(int(x) for x in ij[idx])
+        if cell in cell_to_idx and maze_map[cell] == 0:
+            result[idx] = int(cell_to_idx[cell])
+    return result
+
+
+def free_cell_to_state_indices(state_to_cell, num_cells, valid_idxs=None):
+    """Return state-index arrays for every free cell."""
+    state_to_cell = np.asarray(state_to_cell, dtype=np.int32)
+    if valid_idxs is None:
+        idxs = np.arange(len(state_to_cell), dtype=np.int32)
+    else:
+        idxs = np.asarray(valid_idxs, dtype=np.int32)
+    result = [[] for _ in range(int(num_cells))]
+    for idx in idxs:
+        cell_idx = int(state_to_cell[idx])
+        if cell_idx >= 0:
+            result[cell_idx].append(int(idx))
+    return [np.asarray(items, dtype=np.int32) for items in result]
+
+
+def sample_grid_budget_pairs(
+    dataset,
+    state_to_cell,
+    goal_by_cell,
+    cell_distances,
+    steps_per_cell,
+    budget,
+    num_pairs,
+    rng,
+    pos_boundary_frac=0.5,
+    neg_max_factor=2.0,
+    source_idxs=None,
+):
+    """Sample balanced layout-grid geodesic pairs for one budget."""
+    budget = int(budget)
+    rng = np.random.default_rng() if rng is None else rng
+    state_to_cell = np.asarray(state_to_cell, dtype=np.int32)
+    if source_idxs is None:
+        src_idxs = source_indices(dataset)
+    else:
+        src_idxs = np.asarray(source_idxs, dtype=np.int32)
+    src_idxs = src_idxs[state_to_cell[src_idxs] >= 0]
+    has_goal = np.asarray([len(items) > 0 for items in goal_by_cell])
+    step_distances = np.asarray(cell_distances, dtype=np.float32) * float(
+        steps_per_cell
+    )
+
+    observations = []
+    actions = []
+    goals = []
+    budgets = []
+    labels = []
+    grid_distances = []
+    source_cells = []
+    goal_cells = []
+
+    def add_pairs(target_label, target_count):
+        attempts = 0
+        max_attempts = max(1000, int(target_count) * 100)
+        while target_count > 0 and attempts < max_attempts:
+            attempts += 1
+            src_idx = int(rng.choice(src_idxs))
+            src_cell = int(state_to_cell[src_idx])
+            distances = step_distances[src_cell]
+            finite = (cell_distances[src_cell] >= 0) & has_goal
+            if target_label == 1.0:
+                lo = max(0.0, float(pos_boundary_frac) * budget)
+                hi = float(budget)
+                candidate_mask = finite & (distances >= lo) & (distances <= hi)
+                if not candidate_mask.any() and lo > 0.0:
+                    candidate_mask = finite & (distances <= hi)
+            else:
+                lo = np.nextafter(float(budget), np.inf)
+                hi = float(neg_max_factor) * budget
+                candidate_mask = finite & (distances >= lo) & (distances <= hi)
+                if not candidate_mask.any():
+                    candidate_mask = finite & (distances > float(budget))
+
+            candidate_cells = np.nonzero(candidate_mask)[0]
+            if len(candidate_cells) == 0:
+                continue
+            goal_cell = int(rng.choice(candidate_cells))
+            goal_idx = int(rng.choice(goal_by_cell[goal_cell]))
+            observations.append(np.asarray(dataset["observations"])[src_idx])
+            actions.append(np.asarray(dataset["actions"])[src_idx])
+            goals.append(np.asarray(dataset["observations"])[goal_idx])
+            budgets.append(budget)
+            labels.append(target_label)
+            grid_distances.append(float(distances[goal_cell]))
+            source_cells.append(src_cell)
+            goal_cells.append(goal_cell)
+            target_count -= 1
+
+    num_pos = int(num_pairs) // 2
+    num_neg = int(num_pairs) - num_pos
+    add_pairs(1.0, num_pos)
+    add_pairs(0.0, num_neg)
+
+    if len(labels) == 0:
+        return None
+    return dict(
+        observations=np.asarray(observations, dtype=np.float32),
+        actions=np.asarray(actions, dtype=np.float32),
+        goals=np.asarray(goals, dtype=np.float32),
+        budgets=np.asarray(budgets, dtype=np.int32),
+        labels=np.asarray(labels, dtype=np.float32),
+        grid_distances=np.asarray(grid_distances, dtype=np.float32),
+        source_cells=np.asarray(source_cells, dtype=np.int32),
+        goal_cells=np.asarray(goal_cells, dtype=np.int32),
+    )
 
 
 def grid_distance_statistics(cell_distances, steps_per_cell):

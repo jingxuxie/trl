@@ -207,6 +207,9 @@ class GCDataset:
             "actor_p_randomgoal": 0.5,
             "actor_geom_sample": True,
             "gc_negative": True,
+            "reachability_label_type": "logged_offset",
+            "graph_path": "exp/bmm_pointmaze_graph.npz",
+            "geodesic_distance_source": "grid",
         }
 
         self.config["dataset"] = ConfigDict(
