@@ -167,6 +167,7 @@ def sample_action_queries(
 
     observations = []
     actions = []
+    next_observations = []
     goals = []
     labels = []
     distances = []
@@ -235,6 +236,7 @@ def sample_action_queries(
             )
         )
         actions.append(np.asarray(dataset["actions"])[candidate_idxs])
+        next_observations.append(np.asarray(dataset["observations"])[candidate_idxs + 1])
         goals.append(
             np.repeat(
                 np.asarray(dataset["observations"])[goal_idx][None, :],
@@ -257,6 +259,7 @@ def sample_action_queries(
     return dict(
         observations=np.asarray(observations, dtype=np.float32),
         actions=np.asarray(actions, dtype=np.float32),
+        next_observations=np.asarray(next_observations, dtype=np.float32),
         goals=np.asarray(goals, dtype=np.float32),
         labels=np.asarray(labels, dtype=np.float32),
         distances=np.asarray(distances, dtype=np.float32),
@@ -267,6 +270,39 @@ def sample_action_queries(
         budget=int(budget),
         remaining_budget=float(remaining_budget),
     )
+
+
+QUERY_CACHE_KEYS = (
+    "observations",
+    "actions",
+    "next_observations",
+    "goals",
+    "labels",
+    "distances",
+    "source_distances",
+    "source_cells",
+    "goal_cells",
+    "candidate_source_idxs",
+)
+
+
+def save_query_cache(path, queries):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {key: np.asarray(queries[key]) for key in QUERY_CACHE_KEYS}
+    payload["budget"] = np.asarray(int(queries["budget"]), dtype=np.int32)
+    payload["remaining_budget"] = np.asarray(
+        float(queries["remaining_budget"]), dtype=np.float32
+    )
+    np.savez_compressed(path, **payload)
+
+
+def load_query_cache(path):
+    data = np.load(path, allow_pickle=False)
+    queries = {key: np.asarray(data[key]) for key in QUERY_CACHE_KEYS}
+    queries["budget"] = int(np.asarray(data["budget"]))
+    queries["remaining_budget"] = float(np.asarray(data["remaining_budget"]))
+    return queries
 
 
 def pairwise_ranking_accuracy(scores, distances, eps=1e-6):
@@ -333,6 +369,20 @@ def action_ranking_metrics(scores, labels, distances, source_distances):
     return metrics
 
 
+def baseline_score_tables(queries, rng):
+    labels_shape = queries["labels"].shape
+    source_scores = -np.repeat(
+        np.asarray(queries["source_distances"], dtype=np.float32)[:, None],
+        labels_shape[1],
+        axis=1,
+    )
+    return {
+        "oracle_distance": -np.asarray(queries["distances"], dtype=np.float32),
+        "source_distance": source_scores,
+        "random": rng.random(labels_shape).astype(np.float32),
+    }
+
+
 def score_flat(agent, observations, actions, goals, budgets, batch_size):
     mean_scores = []
     min_scores = []
@@ -382,12 +432,92 @@ def score_queries(agent, queries, budget, interp_budgets, batch_size):
     return result
 
 
-def configure_restore_agent(args, train_dataset, budgets):
+def score_queries_with_budget_array(agent, queries, budget_by_query, batch_size):
+    shape = queries["labels"].shape
+    observations = queries["observations"].reshape((-1, queries["observations"].shape[-1]))
+    actions = queries["actions"].reshape((-1, queries["actions"].shape[-1]))
+    goals = queries["goals"].reshape((-1, queries["goals"].shape[-1]))
+    budget_grid = np.repeat(
+        np.asarray(budget_by_query, dtype=np.int32)[:, None], shape[1], axis=1
+    ).reshape(-1)
+    mean_scores, min_scores = score_flat(
+        agent, observations, actions, goals, budget_grid, batch_size
+    )
+    return mean_scores.reshape(shape), min_scores.reshape(shape)
+
+
+def score_v_next_teacher(value_agent, queries, budget, batch_size):
+    shape = queries["labels"].shape
+    observations = queries["next_observations"].reshape(
+        (-1, queries["next_observations"].shape[-1])
+    )
+    actions = queries["actions"].reshape((-1, queries["actions"].shape[-1]))
+    goals = queries["goals"].reshape((-1, queries["goals"].shape[-1]))
+    remaining = max(int(budget) - 1, 1)
+    budgets = np.full(len(observations), int(remaining), dtype=np.int32)
+    mean_scores, min_scores = score_flat(
+        value_agent, observations, actions, goals, budgets, batch_size
+    )
+    return {
+        "v_next_teacher_mean": mean_scores.reshape(shape),
+        "v_next_teacher_ensemble_min": min_scores.reshape(shape),
+    }
+
+
+def score_value_sources(value_agent, queries, budgets, batch_size):
+    observations = queries["observations"][:, 0]
+    actions = queries["actions"][:, 0]
+    goals = queries["goals"][:, 0]
+    rows = []
+    for budget in budgets:
+        budget_arr = np.full(len(observations), int(budget), dtype=np.int32)
+        mean_scores, _ = score_flat(
+            value_agent, observations, actions, goals, budget_arr, batch_size
+        )
+        rows.append(mean_scores)
+    return np.stack(rows, axis=1)
+
+
+def budget_scan_arrays(value_agent, queries, budgets, tau, modes, batch_size):
+    budgets = np.asarray(tuple(int(x) for x in budgets), dtype=np.int32)
+    value_scores = score_value_sources(value_agent, queries, budgets, batch_size)
+    above = value_scores >= float(tau)
+    first_idxs = np.where(above.any(axis=1), np.argmax(above, axis=1), len(budgets) - 1)
+    arrays = {}
+    for mode in modes:
+        mode = str(mode).strip()
+        if not mode:
+            continue
+        if mode == "hat":
+            idxs = first_idxs
+        elif mode == "prev":
+            idxs = np.maximum(first_idxs - 1, 0)
+        elif mode == "next":
+            idxs = np.minimum(first_idxs + 1, len(budgets) - 1)
+        else:
+            raise ValueError(f"Unsupported budget scan mode: {mode}")
+        arrays[mode] = budgets[idxs].astype(np.int32)
+    hist = {
+        f"H{int(budget)}": int((budgets[first_idxs] == int(budget)).sum())
+        for budget in budgets
+    }
+    return arrays, {
+        "tau": float(tau),
+        "h_hat_mean": float(budgets[first_idxs].mean()),
+        "h_hat_hist": hist,
+        "value_score_mean_by_budget": {
+            f"H{int(budget)}": float(value_scores[:, idx].mean())
+            for idx, budget in enumerate(budgets)
+        },
+    }
+
+
+def configure_restore_agent(args, train_dataset, budgets, critic_mode="action"):
     config = get_config()
     config.budgets = tuple(int(x) for x in budgets)
     config.max_budget = max(int(x) for x in budgets)
     config.batch_size = 1
-    config.diagnostic_critic_mode = "action"
+    config.diagnostic_critic_mode = str(critic_mode)
     config.value_only = True
     config.lambda_sup = 1.0
     config.lambda_rank = 0.0
@@ -415,10 +545,59 @@ def summarize_markdown(result):
         f"env: `{result['env_name']}`",
         f"budget: `{result['budget']}`",
         f"queries: `{result['num_queries']}`, candidates/query: `{result['candidate_count']}`",
-        "",
-        "| critic | score | pair_acc | AUC | gap | selected_d | logged_d | random_d | selected_improve | selected_success |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
+    if result.get("budget_scan") is not None:
+        scan = result["budget_scan"]
+        lines.extend(
+            [
+                f"budget scan tau: `{scan['tau']}`",
+                f"H_hat mean: `{format_metric(scan['h_hat_mean'])}`",
+                "",
+                "H_hat histogram:",
+                "",
+                "| budget | count | mean V |",
+                "|---|---:|---:|",
+            ]
+        )
+        for key, count in scan["h_hat_hist"].items():
+            lines.append(
+                f"| {key} | {count} | "
+                f"{format_metric(scan['value_score_mean_by_budget'].get(key))} |"
+            )
+    lines.extend(
+        [
+            "",
+            "Baselines:",
+            "",
+            "| score | pair_acc | AUC | gap | selected_d | logged_d | random_d | selected_improve | selected_success |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for score_name, metrics in result.get("baselines", {}).items():
+        gap = metrics["pos_mean"] - metrics["neg_mean"]
+        lines.append(
+            "| {score} | {pair_acc} | {auc} | {gap} | "
+            "{selected_d} | {logged_d} | {random_d} | {improve} | {success} |".format(
+                score=score_name,
+                pair_acc=format_metric(metrics["pairwise_accuracy"]),
+                auc=format_metric(metrics["action_auc"]),
+                gap=format_metric(gap),
+                selected_d=format_metric(metrics["selected_distance_mean"]),
+                logged_d=format_metric(metrics["logged_distance_mean"]),
+                random_d=format_metric(metrics["random_distance_mean"]),
+                improve=format_metric(metrics["selected_improves_frac"]),
+                success=format_metric(metrics["selected_success_frac"]),
+            )
+        )
+    lines.extend(
+        [
+            "",
+            "Critics:",
+            "",
+            "| critic | score | pair_acc | AUC | gap | selected_d | logged_d | random_d | selected_improve | selected_success |",
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
     for critic in result["critics"]:
         for score_name, metrics in critic["scores"].items():
             gap = metrics["pos_mean"] - metrics["neg_mean"]
@@ -451,6 +630,13 @@ def main(argv=None):
     parser.add_argument("--budget", type=int, default=160)
     parser.add_argument("--interp_budgets", default="40,80")
     parser.add_argument("--critics", nargs="+", required=True)
+    parser.add_argument("--value_restore_path", default=None)
+    parser.add_argument("--value_restore_epoch", type=int, default=None)
+    parser.add_argument("--budget_scan_tau", type=float, default=0.5)
+    parser.add_argument("--budget_scan_modes", default="hat,prev,next")
+    parser.add_argument("--query_cache_path", default=None)
+    parser.add_argument("--save_query_cache", action="store_true")
+    parser.add_argument("--load_query_cache", action="store_true")
     parser.add_argument("--num_queries", type=int, default=512)
     parser.add_argument("--candidate_count", type=int, default=8)
     parser.add_argument("--score_batch_size", type=int, default=8192)
@@ -464,6 +650,9 @@ def main(argv=None):
 
     budgets = parse_int_list(args.budgets)
     interp_budgets = parse_int_list(args.interp_budgets)
+    budget_scan_modes = tuple(
+        part.strip() for part in str(args.budget_scan_modes).split(",") if part.strip()
+    )
     rng = np.random.default_rng(args.seed)
     dataset_path = dataset_path_from_dir(args.dataset_dir)
     env, train_dataset, val_dataset = make_env_and_datasets(
@@ -476,14 +665,62 @@ def main(argv=None):
         parse_xy_dims(args.xy_dims),
         args.geodesic_budget_unit,
     )
-    queries = sample_action_queries(
-        val_dataset,
-        context,
-        args.budget,
-        args.num_queries,
-        args.candidate_count,
-        rng,
-    )
+    if args.load_query_cache:
+        if args.query_cache_path is None:
+            raise ValueError("--load_query_cache requires --query_cache_path.")
+        queries = load_query_cache(args.query_cache_path)
+        if int(queries["budget"]) != int(args.budget):
+            raise ValueError(
+                f"Cached query budget {queries['budget']} does not match "
+                f"--budget={args.budget}."
+            )
+    else:
+        queries = sample_action_queries(
+            val_dataset,
+            context,
+            args.budget,
+            args.num_queries,
+            args.candidate_count,
+            rng,
+        )
+    if args.save_query_cache:
+        if args.query_cache_path is None:
+            raise ValueError("--save_query_cache requires --query_cache_path.")
+        save_query_cache(args.query_cache_path, queries)
+
+    value_agent = None
+    if args.value_restore_path is not None or args.value_restore_epoch is not None:
+        if args.value_restore_path is None or args.value_restore_epoch is None:
+            raise ValueError(
+                "--value_restore_path and --value_restore_epoch must be set together."
+            )
+        value_agent = configure_restore_agent(
+            args, train_dataset, budgets, critic_mode="state"
+        )
+        value_agent = restore_agent(
+            value_agent, args.value_restore_path, args.value_restore_epoch
+        )
+
+    baseline_rng = np.random.default_rng(args.seed + 1729)
+    baseline_scores = baseline_score_tables(queries, baseline_rng)
+    if value_agent is not None:
+        baseline_scores.update(
+            score_v_next_teacher(
+                value_agent, queries, args.budget, args.score_batch_size
+            )
+        )
+        budget_scan_by_mode, budget_scan_info = budget_scan_arrays(
+            value_agent,
+            queries,
+            budgets,
+            args.budget_scan_tau,
+            budget_scan_modes,
+            args.score_batch_size,
+        )
+    else:
+        budget_scan_by_mode = {}
+        budget_scan_info = None
+
     result = dict(
         env_name=args.env_name,
         geodesic_budget_unit=args.geodesic_budget_unit,
@@ -496,6 +733,12 @@ def main(argv=None):
         label_positive_frac=float(queries["labels"].mean()),
         source_cell_count=int(len(np.unique(queries["source_cells"]))),
         goal_cell_count=int(len(np.unique(queries["goal_cells"]))),
+        query_cache_path=args.query_cache_path,
+        loaded_query_cache=bool(args.load_query_cache),
+        saved_query_cache=bool(args.save_query_cache),
+        value_restore_path=args.value_restore_path,
+        value_restore_epoch=args.value_restore_epoch,
+        budget_scan=budget_scan_info,
         context=dict(
             maze_type=context["maze_type"],
             maze_unit=context["maze_unit"],
@@ -504,6 +747,15 @@ def main(argv=None):
             distance_scale=context["distance_scale"],
         ),
         critics=[],
+        baselines={
+            key: action_ranking_metrics(
+                value,
+                queries["labels"],
+                queries["distances"],
+                queries["source_distances"],
+            )
+            for key, value in baseline_scores.items()
+        },
     )
 
     for spec in args.critics:
@@ -517,6 +769,15 @@ def main(argv=None):
             interp_budgets,
             args.score_batch_size,
         )
+        for mode, budget_by_query in budget_scan_by_mode.items():
+            mean_scores, min_scores = score_queries_with_budget_array(
+                agent,
+                queries,
+                budget_by_query,
+                args.score_batch_size,
+            )
+            scores[f"budget_scan_{mode}_mean"] = mean_scores
+            scores[f"budget_scan_{mode}_ensemble_min"] = min_scores
         score_metrics = {
             key: action_ranking_metrics(
                 value,

@@ -3,6 +3,7 @@
 
 from pathlib import Path
 import sys
+import tempfile
 
 import numpy as np
 
@@ -58,6 +59,39 @@ def main():
         axis=0,
     )
     np.testing.assert_allclose(interp, np.asarray([[0.5, 0.7], [0.4, 0.9]]))
+
+    queries = {
+        "observations": np.zeros((2, 4, 3), dtype=np.float32),
+        "actions": np.zeros((2, 4, 2), dtype=np.float32),
+        "next_observations": np.ones((2, 4, 3), dtype=np.float32),
+        "goals": np.ones((2, 4, 3), dtype=np.float32),
+        "labels": labels,
+        "distances": distances,
+        "source_distances": source_distances,
+        "source_cells": np.asarray([1, 2], dtype=np.int32),
+        "goal_cells": np.asarray([3, 4], dtype=np.int32),
+        "candidate_source_idxs": np.arange(8, dtype=np.int32).reshape(2, 4),
+        "budget": 4,
+        "remaining_budget": 3.0,
+    }
+    baselines = ranking.baseline_score_tables(queries, np.random.default_rng(0))
+    oracle_metrics = ranking.action_ranking_metrics(
+        baselines["oracle_distance"], labels, distances, source_distances
+    )
+    assert np.isclose(oracle_metrics["pairwise_accuracy"], 1.0)
+    source_metrics = ranking.action_ranking_metrics(
+        baselines["source_distance"], labels, distances, source_distances
+    )
+    assert np.isclose(source_metrics["pairwise_accuracy"], 0.5)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cache_path = Path(tmpdir) / "queries.npz"
+        ranking.save_query_cache(cache_path, queries)
+        loaded = ranking.load_query_cache(cache_path)
+        assert loaded["budget"] == 4
+        assert np.isclose(loaded["remaining_budget"], 3.0)
+        for key in ranking.QUERY_CACHE_KEYS:
+            np.testing.assert_allclose(loaded[key], queries[key])
 
     print("BMM action-ranking diagnostic checks passed.")
 
